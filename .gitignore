@@ -1,0 +1,10 @@
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+.DS_Store
+.env
+settings.json
+obsidian_export/
+_*.py
