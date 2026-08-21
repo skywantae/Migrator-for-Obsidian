@@ -331,35 +331,91 @@ def queue_download(ctx: dict, url: str, hint: str) -> str:
     return name
 
 
-def download_files(session: requests.Session, downloads: list, attachments_dir: Path, log) -> int:
-    """S3 서명 URL 은 한 시간이면 만료되므로 페이지를 만들자마자 바로 받는다."""
+# 파일이 아니라 웹페이지가 돌아왔을 때 (이미지 주소인 줄 알았는데 아닌 경우)
+PAGE_TYPES = ("text/html", "application/xhtml", "text/plain")
+
+# Content-Type 으로 알아내는 확장자. 주소에 확장자가 없을 때 쓴다.
+EXT_BY_TYPE = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp", "image/svg+xml": ".svg", "image/heic": ".heic",
+    "image/bmp": ".bmp", "image/tiff": ".tif", "image/avif": ".avif",
+    "application/pdf": ".pdf", "application/zip": ".zip",
+    "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm",
+    "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/wav": ".wav", "audio/ogg": ".ogg",
+}
+
+
+def _corrected_name(name: str, content_type: str) -> str:
+    """주소에서 확장자를 못 알아냈으면 응답 종류를 보고 붙여준다."""
+    ext = EXT_BY_TYPE.get(content_type)
+    if not ext or name.lower().endswith(ext):
+        return name
+    if Path(name).suffix.lower() in ("", ".bin"):
+        return Path(name).stem + ext
+    return name
+
+
+def download_files(session: requests.Session, downloads: list, attachments_dir: Path, log):
+    """첨부를 내려받는다. (받은 개수, 노트에서 고쳐야 할 것들) 을 돌려준다.
+
+    S3 서명 주소는 한 시간이면 만료되므로 페이지를 만들자마자 바로 받는다.
+    받아 보니 파일이 아니라 웹페이지면 저장하지 않고 링크로 남긴다.
+    """
     if not downloads:
-        return 0
+        return 0, {}
     attachments_dir.mkdir(parents=True, exist_ok=True)
 
     def fetch(item):
         url, name = item
-        target = attachments_dir / name
-        if target.exists() and target.stat().st_size > 0:
-            return True
+        if (attachments_dir / name).exists() and (attachments_dir / name).stat().st_size > 0:
+            return name, None, True
         try:
             with session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as r:
                 r.raise_for_status()
-                with open(target, "wb") as fp:
-                    for chunk in r.iter_content(65536):
-                        fp.write(chunk)
-            return True
-        except (requests.RequestException, OSError):
-            target.unlink(missing_ok=True)
-            return False
+                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+
+                if any(ctype.startswith(t) for t in PAGE_TYPES):
+                    return name, ("link", url), False
+
+                fixed = _corrected_name(name, ctype)
+                target = attachments_dir / fixed
+                if target.exists() and target.stat().st_size > 0:
+                    return name, ("rename", fixed), True
+
+                try:
+                    with open(target, "wb") as fp:
+                        for chunk in r.iter_content(65536):
+                            fp.write(chunk)
+                except OSError:
+                    target.unlink(missing_ok=True)
+                    return name, None, False
+
+            return name, ("rename", fixed) if fixed != name else None, True
+        except requests.RequestException:
+            return name, None, False
 
     with ThreadPoolExecutor(max_workers=FILE_WORKERS) as pool:
         results = list(pool.map(fetch, downloads))
 
-    failed = results.count(False)
+    fixes = {name: fix for name, fix, _ in results if fix}
+    saved = sum(1 for _, _, ok in results if ok)
+
+    failed = sum(1 for _, fix, ok in results if not ok and not fix)
     if failed:
         log(f"    첨부 {failed}개를 받지 못했습니다.")
-    return results.count(True)
+    pages = sum(1 for _, fix, _ in results if fix and fix[0] == "link")
+    if pages:
+        log(f"    첨부 {pages}개는 파일이 아니라 웹페이지여서 링크로 남겼습니다.")
+    return saved, fixes
+
+
+def apply_file_fixes(body: str, fixes: dict) -> str:
+    for name, (kind, value) in fixes.items():
+        if kind == "rename":
+            body = body.replace(f"![[{name}]]", f"![[{value}]]")
+        else:
+            body = body.replace(f"![[{name}]]", f"[원본 보기]({value})")
+    return body
 
 
 # ============================== 블록 -> 마크다운 ==============================
@@ -514,15 +570,33 @@ def _render_block(client, block, btype, data, ctx, should_stop, depth, number):
     return None
 
 
+LINK_LABEL = {"video": "영상 보기", "audio": "소리 듣기", "pdf": "PDF 보기"}
+
+
+FILE_SUFFIXES = set(EXT_BY_TYPE.values()) | {
+    ".jpeg", ".svg", ".ico", ".mkv", ".avi", ".flac", ".aac",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".txt", ".md",
+    ".rar", ".7z", ".tar", ".gz",
+}
+
+
+def _looks_like_file(url: str) -> bool:
+    """주소가 진짜 파일을 가리키는가. 유튜브 같은 웹페이지 주소를 걸러낸다."""
+    return Path(unquote(urlparse(url).path)).suffix.lower() in FILE_SUFFIXES
+
+
 def _render_file(block, btype, data, ctx):
     url = _file_url(data)
     if not url:
         return None
     caption = rich_text_to_md(data.get("caption"))
 
+    # 외부 링크는 진짜 파일일 때만 받는다. 웹페이지 주소면 링크로 남긴다.
     external = data.get("type") == "external"
-    if external and not ctx["download_external"]:
-        return f"![{caption}]({url})" if btype == "image" else f"[{caption or url}]({url})"
+    if external and (not ctx["download_external"] or not _looks_like_file(url)):
+        if btype == "image" and _looks_like_file(url):
+            return f"![{caption}]({url})"
+        return f"[{caption or LINK_LABEL.get(btype, '원본 보기')}]({url})"
 
     name = queue_download(ctx, url, btype)
     if not name:
@@ -712,8 +786,10 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
                 front = build_frontmatter(obj, info["title"])
 
                 if settings.get("download_files", True):
-                    stats["files"] += download_files(
+                    saved, fixes = download_files(
                         file_session, ctx["downloads"], attachments_dir, log)
+                    stats["files"] += saved
+                    body = apply_file_fixes(body, fixes)
 
             body = _resolve_page_refs(body, link_map, unresolved)
             front = _resolve_page_refs(front, link_map, unresolved)
