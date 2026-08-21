@@ -1,16 +1,21 @@
 """
-네이버 블로그 -> 옵시디언(Obsidian) 마이그레이션 도구 (GUI)
-==========================================================
+옵시디언(Obsidian) 마이그레이션 도구 (GUI)
+==========================================
 
-- 창에서 저장 위치를 폴더 찾아보기로 고르고, 옵션을 체크한 뒤 [시작하기]를 누르면 됩니다.
+두 곳에서 글을 가져올 수 있습니다.
+
+[네이버 블로그]
 - 블로그 아이디는 로그인한 계정에서 자동으로 알아냅니다.
 - 크롬 창은 로그인 세션(쿠키)을 얻기 위해서만 잠깐 뜨고, 이후 수집은 전부 HTTP로 이뤄집니다.
+- 수집 방식 (Obsidian "Naver Blog Importer" 플러그인과 동일한 고속 방식):
+      목록     PostTitleListAsync.naver  (JSON, 30개씩)
+      본문     PostView.naver?...&redirect=Dlog&widgetTypeCall=true  (HTML 직접 수신)
+      카테고리 m.blog.naver.com/api/blogs/{blogId}/category-list
+      태그     BlogTagListInfo.naver  (여러 글 묶어서 한 번에)
 
-수집 방식 (Obsidian "Naver Blog Importer" 플러그인과 동일한 고속 방식):
-    목록   PostTitleListAsync.naver  (JSON, 30개씩)
-    본문   PostView.naver?...&redirect=Dlog&widgetTypeCall=true  (HTML 직접 수신)
-    카테고리 m.blog.naver.com/api/blogs/{blogId}/category-list
-    태그   BlogTagListInfo.naver  (여러 글 묶어서 한 번에)
+[노션]
+- 통합(Integration) 토큰으로 페이지·데이터베이스·첨부를 전부 가져옵니다.
+- 읽기만 합니다. 노션 데이터는 수정하거나 지우지 않습니다.
 """
 
 import json
@@ -35,8 +40,13 @@ from markdownify import markdownify as md
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 
+from migrator_common import Stopped
+from notion_importer import check_token as notion_check_token
+from notion_importer import run_notion_migration
+
 # ============================== 설정값 ==============================
 DEFAULT_SUBFOLDER = "네이버블로그"
+NOTION_SUBFOLDER = "노션"
 LOGIN_TIMEOUT = 300          # 로그인 대기 최대 시간(초). 로그인되면 즉시 진행
 COUNT_PER_PAGE = 30
 MAX_LIST_PAGES = 200
@@ -76,10 +86,6 @@ SELECTORS = {
 }
 
 
-class Stopped(Exception):
-    """사용자가 중단을 요청했을 때 발생."""
-
-
 # ============================== 볼트 탐지 ==============================
 def detect_obsidian_vaults() -> list:
     """설치된 옵시디언의 obsidian.json에서 볼트 경로 목록을 찾는다 (최근에 연 순서)."""
@@ -95,11 +101,11 @@ def detect_obsidian_vaults() -> list:
     return [Path(v["path"]) for v in ordered if v.get("path")]
 
 
-def default_output_dir() -> Path:
+def default_output_dir(subfolder: str = DEFAULT_SUBFOLDER) -> Path:
     vaults = detect_obsidian_vaults()
     if vaults:
-        return vaults[0] / DEFAULT_SUBFOLDER
-    return BASE_DIR / "obsidian_export"
+        return vaults[0] / subfolder
+    return BASE_DIR / "obsidian_export" / subfolder
 
 
 # ============================== 로그인 ==============================
@@ -743,21 +749,280 @@ def run_migration(settings: dict, log, progress, should_stop):
         "out_dir": out_dir,
     }
 
-
 # ============================== GUI ==============================
 BG = "#f7f7f9"
-ACCENT = "#03c75a"        # 네이버 그린
-ACCENT_DARK = "#02a047"
+NAVER = "#03c75a"          # 네이버 그린
+NAVER_DARK = "#02a047"
+NOTION = "#37352f"         # 노션 잉크
+NOTION_DARK = "#25231e"
 TEXT = "#1a1a1a"
 MUTED = "#6b7280"
+OK_GREEN = "#059669"
+WARN = "#d97706"
+DANGER = "#dc2626"
+FONT = "맑은 고딕"
+
+ACCENT = NAVER             # (이전 버전 호환)
+ACCENT_DARK = NAVER_DARK
+
+
+class BaseTab(tk.Frame):
+    """탭 공통 뼈대: 저장 위치 고르기 + 볼트 안내."""
+
+    accent = NAVER
+    accent_dark = NAVER_DARK
+    tab_label = ""
+    caption = ""
+    default_subfolder = DEFAULT_SUBFOLDER
+    settings_key = ""
+
+    def __init__(self, master):
+        super().__init__(master, bg=BG, padx=22, pady=16)
+        self.path_var = tk.StringVar(value=str(default_output_dir(self.default_subfolder)))
+        self._build_path_row()
+        self.build()
+
+    # ---------- 저장 위치 ----------
+    def _build_path_row(self):
+        tk.Label(self, text="저장 위치", bg=BG, fg=TEXT,
+                 font=(FONT, 10, "bold")).pack(anchor="w")
+
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", pady=(6, 2))
+        tk.Entry(row, textvariable=self.path_var, font=(FONT, 9),
+                 relief="solid", bd=1, bg="white").pack(side="left", fill="x",
+                                                        expand=True, ipady=6)
+        tk.Button(row, text="폴더 선택", command=self._choose_folder,
+                  bg="white", fg=TEXT, relief="solid", bd=1, cursor="hand2",
+                  font=(FONT, 9), padx=14).pack(side="left", padx=(8, 0))
+
+        self.path_hint = tk.Label(self, text="", bg=BG, fg=MUTED, font=(FONT, 8))
+        self.path_hint.pack(anchor="w")
+        self.path_var.trace_add("write", lambda *_: self._update_hint())
+        self._update_hint()
+
+    def _update_hint(self):
+        path = Path(self.path_var.get())
+        if (path / ".obsidian").exists() or (path.parent / ".obsidian").exists():
+            self.path_hint.config(text="옵시디언 볼트 안입니다. 옵시디언에서 바로 보입니다.", fg=OK_GREEN)
+        else:
+            self.path_hint.config(
+                text="옵시디언 볼트 밖입니다. 볼트 안 폴더를 고르면 옵시디언에서 바로 볼 수 있습니다.",
+                fg=WARN)
+
+    def _choose_folder(self):
+        current = Path(self.path_var.get())
+        initial = current if current.exists() else (
+            current.parent if current.parent.exists() else Path.home())
+        chosen = filedialog.askdirectory(title="저장할 폴더를 선택하세요", initialdir=str(initial))
+        if chosen:
+            self.path_var.set(str(Path(chosen)))
+
+    def section(self, text, pady=(16, 0)):
+        tk.Label(self, text=text, bg=BG, fg=TEXT,
+                 font=(FONT, 10, "bold")).pack(anchor="w", pady=pady)
+
+    def check(self, text, var, **kw):
+        tk.Checkbutton(self, text=text, variable=var, bg=BG, fg=TEXT,
+                       activebackground=BG, font=(FONT, 9), cursor="hand2",
+                       **kw).pack(anchor="w", pady=(4, 0))
+
+    # ---------- 하위 클래스가 채운다 ----------
+    def build(self):
+        raise NotImplementedError
+
+    def collect(self) -> dict:
+        """설정값을 모은다. 문제가 있으면 messagebox 를 띄우고 None 을 돌려준다."""
+        raise NotImplementedError
+
+    def run(self, settings, log, progress, should_stop):
+        raise NotImplementedError
+
+    def restore(self, saved: dict):
+        if saved.get("out_dir"):
+            self.path_var.set(saved["out_dir"])
+        self._update_hint()
+
+
+class NaverTab(BaseTab):
+    accent, accent_dark = NAVER, NAVER_DARK
+    tab_label = "  네이버 블로그  "
+    caption = "글·이미지를 옵시디언 노트로 옮기고 자동으로 연결합니다"
+    default_subfolder = DEFAULT_SUBFOLDER
+    settings_key = "naver"
+
+    def build(self):
+        self.section("가져올 글")
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", pady=(6, 0))
+
+        self.scope_var = tk.StringVar(value="all")
+        tk.Radiobutton(row, text="전체", variable=self.scope_var, value="all",
+                       bg=BG, fg=TEXT, activebackground=BG, font=(FONT, 9),
+                       cursor="hand2", command=self._toggle_count).pack(side="left")
+        tk.Radiobutton(row, text="최신", variable=self.scope_var, value="some",
+                       bg=BG, fg=TEXT, activebackground=BG, font=(FONT, 9),
+                       cursor="hand2", command=self._toggle_count).pack(side="left", padx=(14, 4))
+        self.count_spin = tk.Spinbox(row, from_=1, to=9999, width=6, font=(FONT, 9),
+                                     relief="solid", bd=1, justify="center")
+        self.count_spin.delete(0, "end")
+        self.count_spin.insert(0, "10")
+        self.count_spin.pack(side="left")
+        tk.Label(row, text="개", bg=BG, fg=TEXT, font=(FONT, 9)).pack(side="left", padx=(4, 0))
+        self._toggle_count()
+
+        self.section("옵션")
+        self.img_var = tk.BooleanVar(value=True)
+        self.link_var = tk.BooleanVar(value=True)
+        self.check("이미지를 원본 화질로 저장", self.img_var)
+        self.check("카테고리 · 관련 글 자동 링크 만들기", self.link_var)
+
+        tk.Label(self, text="시작하면 크롬 창이 열립니다. 로그인하면 알아서 다음으로 넘어갑니다.",
+                 bg=BG, fg=MUTED, font=(FONT, 8)).pack(anchor="w", pady=(12, 0))
+
+    def _toggle_count(self):
+        self.count_spin.config(state="normal" if self.scope_var.get() == "some" else "disabled")
+
+    def collect(self):
+        max_posts = 0
+        if self.scope_var.get() == "some":
+            try:
+                max_posts = max(1, int(self.count_spin.get()))
+            except ValueError:
+                messagebox.showwarning("확인", "가져올 글 개수를 숫자로 입력해 주세요.")
+                return None
+
+        out_dir = self.path_var.get().strip()
+        if not out_dir:
+            messagebox.showwarning("확인", "저장 위치를 선택해 주세요.")
+            return None
+
+        return {
+            "out_dir": out_dir,
+            "max_posts": max_posts,
+            "download_images": self.img_var.get(),
+            "make_links": self.link_var.get(),
+        }
+
+    def run(self, settings, log, progress, should_stop):
+        return run_migration(settings, log, progress, should_stop)
+
+    def restore(self, saved):
+        super().restore(saved)
+        self.img_var.set(saved.get("download_images", True))
+        self.link_var.set(saved.get("make_links", True))
+        if saved.get("max_posts"):
+            self.scope_var.set("some")
+            self.count_spin.delete(0, "end")
+            self.count_spin.insert(0, str(saved["max_posts"]))
+        self._toggle_count()
+
+
+class NotionTab(BaseTab):
+    accent, accent_dark = NOTION, NOTION_DARK
+    tab_label = "  노션  "
+    caption = "페이지·데이터베이스·첨부를 통째로 옮깁니다 (읽기 전용)"
+    default_subfolder = NOTION_SUBFOLDER
+    settings_key = "notion"
+
+    def build(self):
+        self.section("통합(Integration) 토큰")
+
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", pady=(6, 2))
+        self.token_var = tk.StringVar()
+        self.token_entry = tk.Entry(row, textvariable=self.token_var, font=("Consolas", 9),
+                                    relief="solid", bd=1, bg="white", show="●")
+        self.token_entry.pack(side="left", fill="x", expand=True, ipady=6)
+        self.show_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row, text="보기", variable=self.show_var, bg=BG, fg=MUTED,
+                       activebackground=BG, font=(FONT, 8), cursor="hand2",
+                       command=self._toggle_show).pack(side="left", padx=(6, 0))
+        tk.Button(row, text="연결 확인", command=self._verify,
+                  bg="white", fg=TEXT, relief="solid", bd=1, cursor="hand2",
+                  font=(FONT, 9), padx=12).pack(side="left", padx=(8, 0))
+
+        self.token_hint = tk.Label(self, text="notion.so/my-integrations 에서 만든 토큰 (ntn_ 또는 secret_ 로 시작)",
+                                   bg=BG, fg=MUTED, font=(FONT, 8), anchor="w", justify="left")
+        self.token_hint.pack(anchor="w", fill="x")
+
+        guide = tk.Frame(self, bg="#efeee9", padx=12, pady=10)
+        guide.pack(fill="x", pady=(12, 0))
+        tk.Label(guide, text="처음이라면 노션에서 한 번만 해주세요", bg="#efeee9", fg=NOTION,
+                 font=(FONT, 9, "bold")).pack(anchor="w")
+        tk.Label(guide,
+                 text="옮기고 싶은 최상위 페이지 열기 → 우측 상단 ··· → 연결 → 통합 이름 추가\n"
+                      "하위 페이지와 데이터베이스는 자동으로 따라옵니다.",
+                 bg="#efeee9", fg="#5b574d", font=(FONT, 8), justify="left").pack(anchor="w")
+
+        self.section("옵션")
+        self.files_var = tk.BooleanVar(value=True)
+        self.skip_var = tk.BooleanVar(value=True)
+        self.check("이미지 · 파일 · PDF 첨부 모두 내려받기", self.files_var)
+        self.check("이미 있는 노트는 건너뛰기", self.skip_var)
+
+    def _toggle_show(self):
+        self.token_entry.config(show="" if self.show_var.get() else "●")
+
+    def _verify(self):
+        token = self.token_var.get().strip()
+        if not token:
+            self.token_hint.config(text="토큰을 먼저 붙여넣어 주세요.", fg=WARN)
+            return
+        self.token_hint.config(text="확인하는 중...", fg=MUTED)
+
+        def work():
+            try:
+                info = notion_check_token(token)
+            except Exception as e:
+                self.after(0, lambda: self.token_hint.config(text=f"연결 실패 · {e}", fg=DANGER))
+                return
+
+            if info["shared"] == 0:
+                msg = (f"「{info['workspace']}」에 연결됐지만 공유된 페이지가 0개입니다. "
+                       "노션에서 페이지에 통합을 추가해 주세요.")
+                self.after(0, lambda: self.token_hint.config(text=msg, fg=WARN))
+            else:
+                more = "개 이상" if info["has_more"] else "개"
+                msg = f"「{info['workspace']}」 연결됨 · 접근 가능한 항목 {info['shared']}{more}"
+                self.after(0, lambda: self.token_hint.config(text=msg, fg=OK_GREEN))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def collect(self):
+        token = self.token_var.get().strip()
+        if not token:
+            messagebox.showwarning("확인", "노션 통합 토큰을 입력해 주세요.")
+            return None
+
+        out_dir = self.path_var.get().strip()
+        if not out_dir:
+            messagebox.showwarning("확인", "저장 위치를 선택해 주세요.")
+            return None
+
+        return {
+            "out_dir": out_dir,
+            "notion_token": token,
+            "download_files": self.files_var.get(),
+            "skip_existing": self.skip_var.get(),
+        }
+
+    def run(self, settings, log, progress, should_stop):
+        return run_notion_migration(settings, log, progress, should_stop)
+
+    def restore(self, saved):
+        super().restore(saved)
+        self.token_var.set(saved.get("notion_token", ""))
+        self.files_var.set(saved.get("download_files", True))
+        self.skip_var.set(saved.get("skip_existing", True))
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("네이버 블로그 → 옵시디언")
-        self.geometry("720x760")
-        self.minsize(640, 700)
+        self.title("옵시디언 마이그레이션")
+        self.geometry("760x820")
+        self.minsize(680, 720)
         self.configure(bg=BG)
 
         self.msg_queue = queue.Queue()
@@ -775,138 +1040,110 @@ class App(tk.Tk):
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TProgressbar", troughcolor="#e5e7eb", background=ACCENT,
-                        bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT, thickness=14)
+        style.configure("TProgressbar", troughcolor="#e5e7eb", background=NAVER,
+                        bordercolor=BG, lightcolor=NAVER, darkcolor=NAVER, thickness=14)
+        style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook.Tab", background="#e5e7eb", foreground=MUTED,
+                        padding=(18, 9), font=(FONT, 10, "bold"), borderwidth=0)
+        style.map("TNotebook.Tab",
+                  background=[("selected", BG)], foreground=[("selected", TEXT)])
 
-        header = tk.Frame(self, bg=ACCENT, height=76)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(header, text="네이버 블로그 → 옵시디언", bg=ACCENT, fg="white",
-                 font=("맑은 고딕", 16, "bold")).pack(anchor="w", padx=24, pady=(16, 0))
-        tk.Label(header, text="글·이미지를 옵시디언 노트로 옮기고 자동으로 연결합니다",
-                 bg=ACCENT, fg="#e8fff1", font=("맑은 고딕", 9)).pack(anchor="w", padx=24)
+        # 헤더
+        self.header = tk.Frame(self, bg=NAVER, height=76)
+        self.header.pack(fill="x")
+        self.header.pack_propagate(False)
+        self.header_title = tk.Label(self.header, text="옵시디언 마이그레이션", bg=NAVER,
+                                     fg="white", font=(FONT, 16, "bold"))
+        self.header_title.pack(anchor="w", padx=24, pady=(16, 0))
+        self.header_sub = tk.Label(self.header, text="", bg=NAVER, fg="#eef7f1", font=(FONT, 9))
+        self.header_sub.pack(anchor="w", padx=24)
 
-        body = tk.Frame(self, bg=BG)
-        body.pack(fill="both", expand=True, padx=24, pady=18)
+        # 탭
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=18, pady=(12, 0))
 
-        # 저장 위치
-        tk.Label(body, text="저장 위치", bg=BG, fg=TEXT,
-                 font=("맑은 고딕", 10, "bold")).pack(anchor="w")
-        path_row = tk.Frame(body, bg=BG)
-        path_row.pack(fill="x", pady=(6, 2))
+        self.tabs = [NaverTab(self.notebook), NotionTab(self.notebook)]
+        for tab in self.tabs:
+            self.notebook.add(tab, text=tab.tab_label)
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._on_tab_change())
 
-        self.path_var = tk.StringVar(value=str(default_output_dir()))
-        entry = tk.Entry(path_row, textvariable=self.path_var, font=("맑은 고딕", 9),
-                         relief="solid", bd=1, bg="white")
-        entry.pack(side="left", fill="x", expand=True, ipady=6)
-        tk.Button(path_row, text="폴더 선택", command=self._choose_folder,
-                  bg="white", fg=TEXT, relief="solid", bd=1, cursor="hand2",
-                  font=("맑은 고딕", 9), padx=14).pack(side="left", padx=(8, 0))
+        # 아래쪽: 실행 · 진행 · 로그 (탭이 함께 쓴다)
+        bottom = tk.Frame(self, bg=BG)
+        bottom.pack(fill="both", expand=True, padx=24, pady=(6, 18))
 
-        self.path_hint = tk.Label(body, text="", bg=BG, fg=MUTED, font=("맑은 고딕", 8))
-        self.path_hint.pack(anchor="w")
-        self._update_hint()
-        self.path_var.trace_add("write", lambda *_: self._update_hint())
+        self.start_btn = tk.Button(bottom, text="시작하기", command=self._start,
+                                   bg=NAVER, fg="white", relief="flat", cursor="hand2",
+                                   font=(FONT, 11, "bold"), pady=10,
+                                   activebackground=NAVER_DARK, activeforeground="white")
+        self.start_btn.pack(fill="x", pady=(6, 10))
 
-        # 가져올 글
-        tk.Label(body, text="가져올 글", bg=BG, fg=TEXT,
-                 font=("맑은 고딕", 10, "bold")).pack(anchor="w", pady=(16, 0))
-        count_row = tk.Frame(body, bg=BG)
-        count_row.pack(fill="x", pady=(6, 0))
-
-        self.scope_var = tk.StringVar(value="all")
-        tk.Radiobutton(count_row, text="전체", variable=self.scope_var, value="all",
-                       bg=BG, fg=TEXT, activebackground=BG, font=("맑은 고딕", 9),
-                       cursor="hand2", command=self._toggle_count).pack(side="left")
-        tk.Radiobutton(count_row, text="최신", variable=self.scope_var, value="some",
-                       bg=BG, fg=TEXT, activebackground=BG, font=("맑은 고딕", 9),
-                       cursor="hand2", command=self._toggle_count).pack(side="left", padx=(14, 4))
-        self.count_spin = tk.Spinbox(count_row, from_=1, to=9999, width=6, font=("맑은 고딕", 9),
-                                     relief="solid", bd=1, justify="center")
-        self.count_spin.delete(0, "end")
-        self.count_spin.insert(0, "10")
-        self.count_spin.pack(side="left")
-        tk.Label(count_row, text="개", bg=BG, fg=TEXT, font=("맑은 고딕", 9)).pack(side="left", padx=(4, 0))
-        self._toggle_count()
-
-        # 옵션
-        tk.Label(body, text="옵션", bg=BG, fg=TEXT,
-                 font=("맑은 고딕", 10, "bold")).pack(anchor="w", pady=(16, 0))
-        self.img_var = tk.BooleanVar(value=True)
-        self.link_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(body, text="이미지를 원본 화질로 저장", variable=self.img_var,
-                       bg=BG, fg=TEXT, activebackground=BG, font=("맑은 고딕", 9),
-                       cursor="hand2").pack(anchor="w", pady=(4, 0))
-        tk.Checkbutton(body, text="카테고리 · 관련 글 자동 링크 만들기", variable=self.link_var,
-                       bg=BG, fg=TEXT, activebackground=BG, font=("맑은 고딕", 9),
-                       cursor="hand2").pack(anchor="w")
-
-        # 시작 버튼
-        self.start_btn = tk.Button(body, text="시작하기", command=self._start,
-                                   bg=ACCENT, fg="white", relief="flat", cursor="hand2",
-                                   font=("맑은 고딕", 11, "bold"), pady=10,
-                                   activebackground=ACCENT_DARK, activeforeground="white")
-        self.start_btn.pack(fill="x", pady=(18, 10))
-
-        # 진행 상황
-        self.progress_label = tk.Label(body, text="대기 중", bg=BG, fg=MUTED,
-                                       font=("맑은 고딕", 9), anchor="w")
+        self.progress_label = tk.Label(bottom, text="대기 중", bg=BG, fg=MUTED,
+                                       font=(FONT, 9), anchor="w")
         self.progress_label.pack(fill="x")
-        self.progress = ttk.Progressbar(body, mode="determinate", maximum=100)
+        self.progress = ttk.Progressbar(bottom, mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=(4, 10))
 
-        log_frame = tk.Frame(body, bg=BG)
+        log_frame = tk.Frame(bottom, bg=BG)
         log_frame.pack(fill="both", expand=True)
         scroll = tk.Scrollbar(log_frame)
         scroll.pack(side="right", fill="y")
-        self.log_box = tk.Text(log_frame, height=8, font=("Consolas", 8), relief="solid", bd=1,
+        self.log_box = tk.Text(log_frame, height=9, font=("Consolas", 8), relief="solid", bd=1,
                                bg="white", fg="#374151", yscrollcommand=scroll.set, wrap="word")
         self.log_box.pack(fill="both", expand=True)
         scroll.config(command=self.log_box.yview)
         self.log_box.configure(state="disabled")
 
-    def _update_hint(self):
-        path = Path(self.path_var.get())
-        if (path / ".obsidian").exists() or (path.parent / ".obsidian").exists():
-            self.path_hint.config(text="옵시디언 볼트 안입니다. 옵시디언에서 바로 보입니다.", fg="#059669")
-        else:
-            self.path_hint.config(
-                text="옵시디언 볼트 밖입니다. 볼트 안 폴더를 고르면 옵시디언에서 바로 볼 수 있습니다.",
-                fg="#d97706")
+        self._on_tab_change()
 
-    def _toggle_count(self):
-        self.count_spin.config(state="normal" if self.scope_var.get() == "some" else "disabled")
+    def _current_tab(self) -> BaseTab:
+        return self.tabs[self.notebook.index(self.notebook.select())]
 
-    def _choose_folder(self):
-        current = Path(self.path_var.get())
-        initial = current if current.exists() else (current.parent if current.parent.exists() else Path.home())
-        chosen = filedialog.askdirectory(title="글을 저장할 폴더를 선택하세요", initialdir=str(initial))
-        if chosen:
-            self.path_var.set(str(Path(chosen)))
+    def _on_tab_change(self):
+        """탭에 맞춰 헤더와 버튼 색을 바꾼다."""
+        if self.worker and self.worker.is_alive():
+            return
+        tab = self._current_tab()
+        for widget in (self.header, self.header_title, self.header_sub):
+            widget.config(bg=tab.accent)
+        self.header_sub.config(text=tab.caption)
+        self.start_btn.config(bg=tab.accent, activebackground=tab.accent_dark)
+        ttk.Style().configure("TProgressbar", background=tab.accent,
+                              lightcolor=tab.accent, darkcolor=tab.accent)
 
     # ---------- 설정 저장/불러오기 ----------
     def _load_settings(self):
         if not SETTINGS_FILE.exists():
             return
         try:
-            s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
 
-        if s.get("out_dir"):
-            self.path_var.set(s["out_dir"])
-        self.img_var.set(s.get("download_images", True))
-        self.link_var.set(s.get("make_links", True))
-        if s.get("max_posts"):
-            self.scope_var.set("some")
-            self.count_spin.delete(0, "end")
-            self.count_spin.insert(0, str(s["max_posts"]))
-        self._toggle_count()
-        self._update_hint()
+        # 예전 버전은 네이버 설정이 최상위에 그냥 들어 있었다
+        if "naver" not in saved and "notion" not in saved:
+            saved = {"naver": saved}
 
-    def _save_settings(self, settings):
+        for tab in self.tabs:
+            section = saved.get(tab.settings_key)
+            if section:
+                tab.restore(section)
+
+        index = saved.get("active_tab", 0)
+        if 0 <= index < len(self.tabs):
+            self.notebook.select(index)
+
+    def _save_settings(self, tab, settings):
         try:
-            SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2),
+            existing = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            if "naver" not in existing and "notion" not in existing:
+                existing = {"naver": existing}
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+
+        existing[tab.settings_key] = settings
+        existing["active_tab"] = self.notebook.index(self.notebook.select())
+        try:
+            SETTINGS_FILE.write_text(json.dumps(existing, ensure_ascii=False, indent=2),
                                      encoding="utf-8")
         except OSError:
             pass
@@ -918,37 +1155,25 @@ class App(tk.Tk):
             self.start_btn.config(text="중단하는 중...", state="disabled")
             return
 
-        max_posts = 0
-        if self.scope_var.get() == "some":
-            try:
-                max_posts = max(1, int(self.count_spin.get()))
-            except ValueError:
-                messagebox.showwarning("확인", "가져올 글 개수를 숫자로 입력해 주세요.")
-                return
-
-        settings = {
-            "out_dir": self.path_var.get().strip(),
-            "max_posts": max_posts,
-            "download_images": self.img_var.get(),
-            "make_links": self.link_var.get(),
-        }
-        if not settings["out_dir"]:
-            messagebox.showwarning("확인", "저장 위치를 선택해 주세요.")
+        tab = self._current_tab()
+        settings = tab.collect()
+        if settings is None:
             return
 
-        self._save_settings(settings)
+        self._save_settings(tab, settings)
 
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
         self.progress["value"] = 0
+        self.progress_label.config(text="시작하는 중...", fg=MUTED)
         self.stop_flag.clear()
-        self.start_btn.config(text="중단하기", bg="#ef4444", activebackground="#dc2626")
+        self.start_btn.config(text="중단하기", bg=DANGER, activebackground="#b91c1c")
 
-        self.worker = threading.Thread(target=self._work, args=(settings,), daemon=True)
+        self.worker = threading.Thread(target=self._work, args=(tab, settings), daemon=True)
         self.worker.start()
 
-    def _work(self, settings):
+    def _work(self, tab, settings):
         def log(msg):
             self.msg_queue.put(("log", msg))
 
@@ -956,7 +1181,7 @@ class App(tk.Tk):
             self.msg_queue.put(("progress", (current, total, title)))
 
         try:
-            result = run_migration(settings, log, progress, self.stop_flag.is_set)
+            result = tab.run(settings, log, progress, self.stop_flag.is_set)
             self.msg_queue.put(("done", result))
         except Stopped:
             self.msg_queue.put(("stopped", None))
@@ -979,35 +1204,38 @@ class App(tk.Tk):
                     current, total, title = payload
                     self.progress["value"] = (current / total * 100) if total else 0
                     self.progress_label.config(
-                        text=f"{current} / {total}  ·  {title[:40]}" if total else "대기 중")
+                        text=f"{current} / {total}  ·  {str(title)[:40]}" if total else "대기 중",
+                        fg=MUTED)
 
                 elif kind == "done":
                     self._finish()
                     r = payload
                     self.progress["value"] = 100
-                    self.progress_label.config(text=f"완료 · {r['saved']}개 저장", fg="#059669")
-                    messagebox.showinfo(
-                        "완료",
-                        f"글 {r['saved']}개를 저장했습니다.\n"
-                        f"이미지 {r['images']}장 · 소요 시간 {r['elapsed']/60:.1f}분\n"
-                        f"실패 {r['failed']}개\n\n{r['out_dir']}",
-                    )
+                    self.progress_label.config(text=f"완료 · {r['saved']}개 저장", fg=OK_GREEN)
+
+                    detail = [f"노트 {r['saved']}개를 저장했습니다.",
+                              f"첨부 {r['images']}개 · 소요 시간 {r['elapsed'] / 60:.1f}분"]
+                    if r.get("skipped"):
+                        detail.append(f"이미 있어서 건너뜀 {r['skipped']}개")
+                    detail.append(f"실패 {r['failed']}개")
+                    messagebox.showinfo("완료", "\n".join(detail) + f"\n\n{r['out_dir']}")
 
                 elif kind == "stopped":
                     self._finish()
-                    self.progress_label.config(text="중단됨", fg="#d97706")
+                    self.progress_label.config(text="중단됨", fg=WARN)
 
                 elif kind == "error":
                     self._finish()
-                    self.progress_label.config(text="오류 발생", fg="#dc2626")
-                    messagebox.showerror("오류", str(payload)[:1200])
+                    self.progress_label.config(text="오류 발생", fg=DANGER)
+                    messagebox.showerror("오류", str(payload)[:1500])
         except queue.Empty:
             pass
         self.after(100, self._drain_queue)
 
     def _finish(self):
-        self.start_btn.config(text="시작하기", state="normal", bg=ACCENT,
-                              activebackground=ACCENT_DARK)
+        tab = self._current_tab()
+        self.start_btn.config(text="시작하기", state="normal", bg=tab.accent,
+                              activebackground=tab.accent_dark)
 
 
 if __name__ == "__main__":
