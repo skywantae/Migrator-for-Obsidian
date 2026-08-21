@@ -70,16 +70,21 @@ API로는 권한을 줄 수 없어서 노션에서 직접 해주셔야 합니다
 
 ## 설치 및 실행
 
-### 옵션 1: exe 파일 (파이썬 불필요)
-
-`naver_blog_migrator.exe` 를 더블클릭하면 창이 뜹니다.
-
-### 옵션 2: 소스 코드
+### 옵션 1: 소스 코드
 
 ```bash
 pip install -r requirements.txt
 python naver_blog_migrator.py
 ```
+
+### 옵션 2: exe 로 만들어 쓰기 (파이썬 없는 PC 에서)
+
+```bash
+pyinstaller --windowed --onefile --name naver_blog_migrator --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options naver_blog_migrator.py
+```
+
+`dist/naver_blog_migrator.exe` 가 만들어집니다. 더블클릭하면 창이 뜹니다.
+(exe 는 용량이 커서 저장소에 넣지 않았습니다)
 
 ## 사용 방법
 

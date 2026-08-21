@@ -32,6 +32,7 @@ REQUEST_TIMEOUT = 30
 MIN_INTERVAL = 0.34          # 노션 제한: 초당 약 3회
 MAX_RETRIES = 4
 FILE_WORKERS = 8
+FILE_RETRIES = 3            # 첨부 주소가 만료되기 전에 다시 시도
 
 # 내려받을 첨부 블록
 FILE_BLOCKS = {"image", "file", "pdf", "video", "audio"}
@@ -327,9 +328,12 @@ def queue_download(ctx: dict, url: str, hint: str) -> str:
         name = f"{base}_{n}{ext}"
     seen[name] = url
 
-    ctx["downloads"].append((url, name))
+    ctx["downloads"].append((url, name, hint))
     return name
 
+
+# 파일이 아니라 웹페이지였을 때 노트에 남길 링크 이름
+LINK_LABEL = {"video": "영상 보기", "audio": "소리 듣기", "pdf": "PDF 보기"}
 
 # 파일이 아니라 웹페이지가 돌아왔을 때 (이미지 주소인 줄 알았는데 아닌 경우)
 PAGE_TYPES = ("text/html", "application/xhtml", "text/plain")
@@ -362,59 +366,72 @@ def download_files(session: requests.Session, downloads: list, attachments_dir: 
     받아 보니 파일이 아니라 웹페이지면 저장하지 않고 링크로 남긴다.
     """
     if not downloads:
-        return 0, {}
+        return 0, {}, []
     attachments_dir.mkdir(parents=True, exist_ok=True)
 
+    def once(url, name, kind):
+        """(고칠 것, 받았는지) 를 돌려준다. 실패하면 예외를 낸다."""
+        with session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as r:
+            r.raise_for_status()
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+
+            # 헤더만 보고 판단하므로, 웹페이지면 본문은 받지도 않고 끊는다
+            if any(ctype.startswith(t) for t in PAGE_TYPES):
+                return ("link", url, kind), False
+
+            fixed = _corrected_name(name, ctype)
+            target = attachments_dir / fixed
+            if target.exists() and target.stat().st_size > 0:
+                return ("rename", fixed) if fixed != name else None, True
+
+            try:
+                with open(target, "wb") as fp:
+                    for chunk in r.iter_content(65536):
+                        fp.write(chunk)
+            except OSError:
+                target.unlink(missing_ok=True)
+                raise
+
+        return ("rename", fixed) if fixed != name else None, True
+
     def fetch(item):
-        url, name = item
+        url, name, kind = item
         if (attachments_dir / name).exists() and (attachments_dir / name).stat().st_size > 0:
-            return name, None, True
-        try:
-            with session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as r:
-                r.raise_for_status()
-                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            return name, url, None, True
 
-                if any(ctype.startswith(t) for t in PAGE_TYPES):
-                    return name, ("link", url), False
-
-                fixed = _corrected_name(name, ctype)
-                target = attachments_dir / fixed
-                if target.exists() and target.stat().st_size > 0:
-                    return name, ("rename", fixed), True
-
-                try:
-                    with open(target, "wb") as fp:
-                        for chunk in r.iter_content(65536):
-                            fp.write(chunk)
-                except OSError:
-                    target.unlink(missing_ok=True)
-                    return name, None, False
-
-            return name, ("rename", fixed) if fixed != name else None, True
-        except requests.RequestException:
-            return name, None, False
+        # 노션의 첨부 주소는 한 시간이면 만료되므로, 잠깐 끊긴 정도는 다시 시도한다
+        for attempt in range(FILE_RETRIES):
+            try:
+                fix, ok = once(url, name, kind)
+                return name, url, fix, ok
+            except (requests.RequestException, OSError):
+                if attempt < FILE_RETRIES - 1:
+                    time.sleep(1.5 * (attempt + 1))
+        return name, url, None, False
 
     with ThreadPoolExecutor(max_workers=FILE_WORKERS) as pool:
         results = list(pool.map(fetch, downloads))
 
-    fixes = {name: fix for name, fix, _ in results if fix}
-    saved = sum(1 for _, _, ok in results if ok)
+    fixes = {name: fix for name, _, fix, _ in results if fix}
+    saved = sum(1 for _, _, _, ok in results if ok)
 
-    failed = sum(1 for _, fix, ok in results if not ok and not fix)
-    if failed:
-        log(f"    첨부 {failed}개를 받지 못했습니다.")
-    pages = sum(1 for _, fix, _ in results if fix and fix[0] == "link")
+    lost = [(name, url) for name, url, fix, ok in results if not ok and not fix]
+    if lost:
+        log(f"    첨부 {len(lost)}개를 끝내 받지 못했습니다.")
+    pages = sum(1 for _, _, fix, _ in results if fix and fix[0] == "link")
     if pages:
         log(f"    첨부 {pages}개는 파일이 아니라 웹페이지여서 링크로 남겼습니다.")
-    return saved, fixes
+    return saved, fixes, lost
 
 
 def apply_file_fixes(body: str, fixes: dict) -> str:
-    for name, (kind, value) in fixes.items():
-        if kind == "rename":
-            body = body.replace(f"![[{name}]]", f"![[{value}]]")
+    """받아 보니 파일이 아니었거나 확장자가 달랐던 것을 노트에 반영한다."""
+    for name, fix in fixes.items():
+        if fix[0] == "rename":
+            body = body.replace(f"![[{name}]]", f"![[{fix[1]}]]")
         else:
-            body = body.replace(f"![[{name}]]", f"[원본 보기]({value})")
+            label = LINK_LABEL.get(fix[2] if len(fix) > 2 else "", "원본 보기")
+            body = body.replace(f"![[{name}]]", f"[{label}]({fix[1]})")
     return body
 
 
@@ -591,9 +608,10 @@ def _render_file(block, btype, data, ctx):
         return None
     caption = rich_text_to_md(data.get("caption"))
 
-    # 외부 링크는 진짜 파일일 때만 받는다. 웹페이지 주소면 링크로 남긴다.
-    external = data.get("type") == "external"
-    if external and (not ctx["download_external"] or not _looks_like_file(url)):
+    # 첨부를 받지 않기로 했다면 원래 주소만 남긴다.
+    # 받기로 했다면 일단 받아 본다. 파일이 아니라 웹페이지면 응답 헤더를 보고
+    # 본문을 받기 전에 끊고 링크로 되돌린다 (download_files 참고).
+    if data.get("type") == "external" and not ctx["download_external"]:
         if btype == "image" and _looks_like_file(url):
             return f"![{caption}]({url})"
         return f"[{caption or LINK_LABEL.get(btype, '원본 보기')}]({url})"
@@ -742,6 +760,7 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
     file_session = requests.Session()
     stats = {"pages": 0, "files": 0, "failed": 0, "skipped": 0}
     unresolved = set()          # 가져오지 못한 페이지로 향하던 링크
+    lost_files = []             # 끝내 받지 못한 첨부 (노트, 파일명, 주소)
     started = time.time()
 
     queue = deque(paths.keys())
@@ -786,10 +805,12 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
                 front = build_frontmatter(obj, info["title"])
 
                 if settings.get("download_files", True):
-                    saved, fixes = download_files(
+                    saved, fixes, lost = download_files(
                         file_session, ctx["downloads"], attachments_dir, log)
                     stats["files"] += saved
                     body = apply_file_fixes(body, fixes)
+                    for fname, furl in lost:
+                        lost_files.append((info["note_name"], fname, furl))
 
             body = _resolve_page_refs(body, link_map, unresolved)
             front = _resolve_page_refs(front, link_map, unresolved)
@@ -813,6 +834,16 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
     if unresolved:
         log(f"\n가져오지 못한 페이지로 향하는 링크 {len(unresolved)}개는 글자만 남겼습니다.")
         log("  노션에서 그 페이지에도 통합을 연결하면 다음 실행 때 링크가 됩니다.")
+
+    if lost_files:
+        report = out_dir / "_받지못한첨부.txt"
+        report.write_text(
+            "여기 적힌 첨부는 끝내 받지 못했습니다. 노트에는 링크만 남아 깨져 보입니다.\n"
+            "해당 노트를 지우고 다시 실행하면 그 노트만 다시 가져옵니다.\n"
+            "(노션의 첨부 주소는 한 시간이면 만료되므로 아래 주소는 이미 못 쓸 수 있습니다)\n\n"
+            + "\n".join(f"[{note}] {fname}\n  {furl}" for note, fname, furl in lost_files),
+            encoding="utf-8")
+        log(f"\n첨부 {len(lost_files)}개를 받지 못했습니다. 목록: {report.name}")
     log(f"\nAPI 호출 {client.calls}회")
     return {
         "elapsed": time.time() - started,
