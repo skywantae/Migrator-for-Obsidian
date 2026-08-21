@@ -11,6 +11,7 @@
 (사용하는 API 는 GET /search /query 뿐이며, 쓰기·삭제 호출은 하지 않습니다.)
 """
 
+import html
 import json
 import re
 import threading
@@ -280,15 +281,19 @@ def property_to_value(prop: dict):
 
 
 def _file_url(obj: dict) -> str:
-    """노션 파일 객체에서 실제 URL 을 꺼낸다 (업로드 파일 / 외부 링크 둘 다)."""
+    """노션 파일 객체에서 실제 URL 을 꺼낸다 (업로드 파일 / 외부 링크 둘 다).
+
+    임베드 주소는 &amp; 처럼 HTML 로 인코딩되어 오는 경우가 있어 되돌린다.
+    """
     if not obj:
         return ""
     kind = obj.get("type")
     if kind == "file":
-        return (obj.get("file") or {}).get("url", "")
+        return html.unescape((obj.get("file") or {}).get("url", ""))
     if kind == "external":
-        return (obj.get("external") or {}).get("url", "")
-    return (obj.get("file") or {}).get("url", "") or (obj.get("external") or {}).get("url", "")
+        return html.unescape((obj.get("external") or {}).get("url", ""))
+    fallback = (obj.get("file") or {}).get("url", "") or (obj.get("external") or {}).get("url", "")
+    return html.unescape(fallback)
 
 
 def page_title(page: dict) -> str:
@@ -312,7 +317,7 @@ def _extension_from_url(url: str, default: str = ".bin") -> str:
     return default
 
 
-def queue_download(ctx: dict, url: str, hint: str) -> str:
+def queue_download(ctx: dict, url: str, hint: str, external: bool = False) -> str:
     """첨부를 내려받기 목록에 넣고, 노트에 쓸 파일 이름을 돌려준다."""
     if not url:
         return ""
@@ -328,7 +333,7 @@ def queue_download(ctx: dict, url: str, hint: str) -> str:
         name = f"{base}_{n}{ext}"
     seen[name] = url
 
-    ctx["downloads"].append((url, name, hint))
+    ctx["downloads"].append({"url": url, "name": name, "kind": hint, "external": external})
     return name
 
 
@@ -347,6 +352,10 @@ EXT_BY_TYPE = {
     "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm",
     "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/wav": ".wav", "audio/ogg": ".ogg",
 }
+
+
+class _Permanent(Exception):
+    """다시 시도해도 결과가 같을 응답 (404, 401 처럼)."""
 
 
 def _corrected_name(name: str, content_type: str) -> str:
@@ -372,12 +381,15 @@ def download_files(session: requests.Session, downloads: list, attachments_dir: 
     def once(url, name, kind):
         """(고칠 것, 받았는지) 를 돌려준다. 실패하면 예외를 낸다."""
         with session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as r:
-            r.raise_for_status()
             ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
 
-            # 헤더만 보고 판단하므로, 웹페이지면 본문은 받지도 않고 끊는다
+            # 헤더만 보고 판단하므로, 웹페이지면 본문은 받지도 않고 끊는다.
+            # 비메오 플레이어처럼 401 을 주는 페이지도 여기서 걸러진다.
             if any(ctype.startswith(t) for t in PAGE_TYPES):
                 return ("link", url, kind), False
+            if 400 <= r.status_code < 500:
+                raise _Permanent(f"HTTP {r.status_code}")
+            r.raise_for_status()
 
             fixed = _corrected_name(name, ctype)
             target = attachments_dir / fixed
@@ -395,7 +407,7 @@ def download_files(session: requests.Session, downloads: list, attachments_dir: 
         return ("rename", fixed) if fixed != name else None, True
 
     def fetch(item):
-        url, name, kind = item
+        url, name, kind = item["url"], item["name"], item["kind"]
         if (attachments_dir / name).exists() and (attachments_dir / name).stat().st_size > 0:
             return name, url, None, True
 
@@ -404,9 +416,16 @@ def download_files(session: requests.Session, downloads: list, attachments_dir: 
             try:
                 fix, ok = once(url, name, kind)
                 return name, url, fix, ok
+            except _Permanent:
+                break
             except (requests.RequestException, OSError):
                 if attempt < FILE_RETRIES - 1:
                     time.sleep(1.5 * (attempt + 1))
+
+        # 외부 링크는 원래 주소가 살아 있으니 링크로 남긴다.
+        # 노션에 올린 파일은 주소가 곧 만료되므로 못 받았다고 알린다.
+        if item["external"]:
+            return name, url, ("link", url, kind), False
         return name, url, None, False
 
     with ThreadPoolExecutor(max_workers=FILE_WORKERS) as pool:
@@ -616,7 +635,7 @@ def _render_file(block, btype, data, ctx):
             return f"![{caption}]({url})"
         return f"[{caption or LINK_LABEL.get(btype, '원본 보기')}]({url})"
 
-    name = queue_download(ctx, url, btype)
+    name = queue_download(ctx, url, btype, data.get("type") == "external")
     if not name:
         return None
 
