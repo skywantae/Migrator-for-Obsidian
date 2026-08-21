@@ -454,9 +454,16 @@ def strip_markdown_for_similarity(markdown_text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()[:TEXT_SAMPLE_LENGTH]
 
 
+def category_dir(out_dir: Path, category: str) -> Path:
+    """글이 들어갈 카테고리 폴더. 카테고리 허브 노트는 이 폴더 옆에 남는다."""
+    return out_dir / (sanitize_filename(category) or "미분류")
+
+
 def save_markdown(out_dir: Path, logno: str, title: str, date: str, category: str,
                   tags: list, url: str, body: str) -> Path:
-    filepath = out_dir / f"{logno}_{sanitize_filename(title) or logno}.md"
+    folder = category_dir(out_dir, category)
+    folder.mkdir(parents=True, exist_ok=True)
+    filepath = folder / f"{logno}_{sanitize_filename(title) or logno}.md"
     tags_yaml = ", ".join(f'"{yaml_escape(t)}"' for t in tags)
     frontmatter = (
         "---\n"
@@ -472,6 +479,11 @@ def save_markdown(out_dir: Path, logno: str, title: str, date: str, category: st
 
 
 # ============================== 자동 링크 ==============================
+def post_file(out_dir: Path, meta: dict) -> Path:
+    """색인이 기억하는 실제 파일 위치. 예전 평면 구조도 받아준다."""
+    return meta.get("path") or out_dir / f"{meta['filename']}.md"
+
+
 def create_category_hub_notes(out_dir: Path, posts_index: dict, log):
     by_category = {}
     for meta in posts_index.values():
@@ -491,7 +503,7 @@ def create_category_hub_notes(out_dir: Path, posts_index: dict, log):
         )
 
         for meta in items:
-            post_path = out_dir / f"{meta['filename']}.md"
+            post_path = post_file(out_dir, meta)
             if not post_path.exists():
                 continue
             content = post_path.read_text(encoding="utf-8")
@@ -522,7 +534,7 @@ def apply_related_links(out_dir: Path, posts_index: dict, log):
             continue
 
         scored.sort(key=lambda x: -x[0])
-        filepath = out_dir / f"{meta['filename']}.md"
+        filepath = post_file(out_dir, meta)
         if not filepath.exists():
             continue
 
@@ -611,7 +623,7 @@ def apply_similar_content_links(out_dir: Path, posts_index: dict, log):
             continue
 
         scored.sort(key=lambda x: -x[0])
-        filepath = out_dir / f"{meta['filename']}.md"
+        filepath = post_file(out_dir, meta)
         if not filepath.exists():
             continue
 
@@ -634,7 +646,7 @@ def rebuild_index_from_existing_files(out_dir: Path) -> dict:
     if not out_dir.exists():
         return posts_index
 
-    for filepath in out_dir.glob("*.md"):
+    for filepath in out_dir.rglob("*.md"):
         m = re.match(r"(\d+)_", filepath.name)
         if not m:
             continue
@@ -652,12 +664,45 @@ def rebuild_index_from_existing_files(out_dir: Path) -> dict:
 
         posts_index[m.group(1)] = {
             "filename": filepath.stem,
+            "path": filepath,
             "title": title_m.group(1).replace('\\"', '"') if title_m else filepath.stem,
             "tags": re.findall(r'"([^"]*)"', tags_m.group(1)) if tags_m else [],
             "category": category_m.group(1).replace('\\"', '"') if category_m else "미분류",
             "text_sample": strip_markdown_for_similarity(strip_linked_sections(body)),
         }
     return posts_index
+
+
+def move_posts_into_category_folders(out_dir: Path, log) -> int:
+    """예전 실행에서 최상위에 흩어져 있던 글을 카테고리 폴더로 옮긴다.
+
+    첨부와 노트 사이 링크는 이름으로 이어지므로 옮겨도 깨지지 않는다.
+    """
+    moved = 0
+    for filepath in sorted(out_dir.glob("*.md")):
+        if not re.match(r"\d+_", filepath.name):
+            continue
+        try:
+            text = filepath.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        m = re.search(r'^category:\s*"(.*)"\s*$', text, re.MULTILINE)
+        folder = category_dir(out_dir, m.group(1).replace('\\"', '"') if m else "미분류")
+        target = folder / filepath.name
+        if target.exists():
+            continue
+
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            filepath.rename(target)
+            moved += 1
+        except OSError as e:
+            log(f"  옮기지 못함: {filepath.name} -> {e}")
+
+    if moved:
+        log(f"기존 글 {moved}개를 카테고리 폴더로 옮겼습니다.")
+    return moved
 
 
 # ============================== 실행 ==============================
@@ -676,6 +721,7 @@ def run_migration(settings: dict, log, progress, should_stop):
     log("해시태그를 가져옵니다...")
     tag_map = fetch_tags(session, blog_id, [p["logNo"] for p in post_list])
 
+    move_posts_into_category_folders(out_dir, log)
     posts_index = rebuild_index_from_existing_files(out_dir)
     failed = []
     total = len(post_list)
@@ -691,7 +737,7 @@ def run_migration(settings: dict, log, progress, should_stop):
 
         logno = entry["logNo"]
 
-        if any(out_dir.glob(f"{logno}_*.md")):
+        if any(out_dir.rglob(f"{logno}_*.md")):
             log(f"[{i}/{total}] 이미 있음 - 건너뜀: {entry['title']}")
             progress(i, total, entry["title"])
             continue
@@ -714,6 +760,7 @@ def run_migration(settings: dict, log, progress, should_stop):
 
             posts_index[logno] = {
                 "filename": filepath.stem,
+                "path": filepath,
                 "title": title,
                 "tags": tags,
                 "category": category,
