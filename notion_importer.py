@@ -36,9 +36,14 @@ FILE_WORKERS = 8
 # 내려받을 첨부 블록
 FILE_BLOCKS = {"image", "file", "pdf", "video", "audio"}
 
-# 블록 안에서 페이지 링크를 잠시 표시해 둘 자리표시자
-PAGE_REF = "\x00PAGEREF:{}\x00"
-PAGE_REF_RE = re.compile("\x00PAGEREF:([0-9a-f-]+)\x00")
+# 블록 안에서 페이지 링크를 잠시 표시해 둘 자리표시자.
+# 모든 페이지를 다 읽은 뒤에야 노트 이름을 알 수 있어서, 일단 표시만 해두고 마지막에 바꾼다.
+# 대상 페이지를 못 가져왔을 때를 대비해 보여줄 이름을 함께 담아 둔다.
+PAGE_REF_RE = re.compile("\x00PAGEREF:([0-9a-f-]+)\\|([^\x00]*)\x00")
+
+
+def page_ref(page_id: str, label: str = "") -> str:
+    return f"\x00PAGEREF:{page_id}|{(label or '').replace('|', '/')}\x00"
 
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
@@ -188,7 +193,7 @@ def rich_text_to_md(rich_text: list) -> str:
             if mtype in ("page", "database"):
                 ref_id = (mention.get(mtype) or {}).get("id")
                 if ref_id:
-                    out.append(PAGE_REF.format(ref_id))
+                    out.append(page_ref(ref_id, rt.get("plain_text", "")))
                     continue
             out.append(rt.get("plain_text", ""))
             continue
@@ -256,7 +261,7 @@ def property_to_value(prop: dict):
             names.append(f.get("name") or _file_url(f) or "")
         return [n for n in names if n]
     if kind == "relation":
-        return [PAGE_REF.format(r["id"]) for r in val or [] if r.get("id")]
+        return [page_ref(r["id"]) for r in val or [] if r.get("id")]
     if kind == "unique_id":
         prefix = (val or {}).get("prefix") or ""
         return f"{prefix}{(val or {}).get('number', '')}"
@@ -488,13 +493,13 @@ def _render_block(client, block, btype, data, ctx, should_stop, depth, number):
 
     if btype in ("child_page", "child_database"):
         ctx["discovered"].append(block["id"])
-        return PAGE_REF.format(block["id"])
+        return page_ref(block["id"], data.get("title", ""))
 
     if btype == "link_to_page":
         ref = data.get("page_id") or data.get("database_id")
         if ref:
             ctx["discovered"].append(ref)
-            return PAGE_REF.format(ref)
+            return page_ref(ref)
         return None
 
     if btype == "table_of_contents":
@@ -662,6 +667,7 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
 
     file_session = requests.Session()
     stats = {"pages": 0, "files": 0, "failed": 0, "skipped": 0}
+    unresolved = set()          # 가져오지 못한 페이지로 향하던 링크
     started = time.time()
 
     queue = deque(paths.keys())
@@ -709,8 +715,8 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
                     stats["files"] += download_files(
                         file_session, ctx["downloads"], attachments_dir, log)
 
-            body = _resolve_page_refs(body, link_map)
-            front = _resolve_page_refs(front, link_map)
+            body = _resolve_page_refs(body, link_map, unresolved)
+            front = _resolve_page_refs(front, link_map, unresolved)
 
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(f"{front}\n\n{body}\n", encoding="utf-8")
@@ -728,6 +734,9 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
 
         progress(done, total, info["note_name"])
 
+    if unresolved:
+        log(f"\n가져오지 못한 페이지로 향하는 링크 {len(unresolved)}개는 글자만 남겼습니다.")
+        log("  노션에서 그 페이지에도 통합을 연결하면 다음 실행 때 링크가 됩니다.")
     log(f"\nAPI 호출 {client.calls}회")
     return {
         "elapsed": time.time() - started,
@@ -815,11 +824,18 @@ def _database_hub_body(client, db: dict, db_id: str, objects: dict, paths: dict)
     return "\n".join(lines)
 
 
-def _resolve_page_refs(text: str, link_map: dict) -> str:
+def _resolve_page_refs(text: str, link_map: dict, unresolved: set = None) -> str:
+    """자리표시자를 위키링크로 바꾼다. 대상을 못 가져왔으면 이름이라도 남긴다."""
     def replace(match):
-        target = link_map.get(match.group(1)) or link_map.get(match.group(1).replace("-", ""))
-        return f"[[{target}]]" if target else ""
-    return PAGE_REF_RE.sub(replace, text)
+        page_id, label = match.group(1), match.group(2)
+        target = link_map.get(page_id) or link_map.get(page_id.replace("-", ""))
+        if target:
+            return f"[[{target}]]"
+        if unresolved is not None:
+            unresolved.add(page_id)
+        return label
+    # 혹시 모양이 어긋난 자리표시자가 남아도 널 바이트가 노트로 새지는 않게 한다
+    return PAGE_REF_RE.sub(replace, text).replace("\x00", "")
 
 
 # ============================== 토큰 확인 ==============================
