@@ -459,11 +459,26 @@ def category_dir(out_dir: Path, category: str) -> Path:
     return out_dir / (sanitize_filename(category) or "미분류")
 
 
+def unique_note_name(base: str, logno: str, used: dict) -> str:
+    """노트 이름은 볼트 전체에서 겹치면 안 된다 (겹치면 [[링크]]가 어느 글인지 흐려진다).
+
+    used 는 {소문자 이름: logNo}. 같은 글이면 그 이름을 그대로 쓴다.
+    """
+    name, n = base, 2
+    while used.get(name.lower(), logno) != logno:
+        name = f"{base} ({n})"
+        n += 1
+    used[name.lower()] = logno
+    return name
+
+
 def save_markdown(out_dir: Path, logno: str, title: str, date: str, category: str,
-                  tags: list, url: str, body: str) -> Path:
+                  tags: list, url: str, body: str, used_names: dict = None) -> Path:
     folder = category_dir(out_dir, category)
     folder.mkdir(parents=True, exist_ok=True)
-    filepath = folder / f"{logno}_{sanitize_filename(title) or logno}.md"
+    base = sanitize_filename(title) or logno
+    name = unique_note_name(base, logno, used_names) if used_names is not None else base
+    filepath = folder / f"{name}.md"
     tags_yaml = ", ".join(f'"{yaml_escape(t)}"' for t in tags)
     frontmatter = (
         "---\n"
@@ -479,6 +494,12 @@ def save_markdown(out_dir: Path, logno: str, title: str, date: str, category: st
 
 
 # ============================== 자동 링크 ==============================
+def wikilink(meta: dict) -> str:
+    """[[제목]] 형태. 파일 이름과 제목이 다를 때만 별명을 붙인다."""
+    name, title = meta["filename"], meta.get("title") or meta["filename"]
+    return f"[[{name}]]" if name == title else f"[[{name}|{title}]]"
+
+
 def post_file(out_dir: Path, meta: dict) -> Path:
     """색인이 기억하는 실제 파일 위치. 예전 평면 구조도 받아준다."""
     return meta.get("path") or out_dir / f"{meta['filename']}.md"
@@ -492,7 +513,7 @@ def create_category_hub_notes(out_dir: Path, posts_index: dict, log):
     for cat, items in by_category.items():
         items.sort(key=lambda m: m["filename"])
         hub_path = out_dir / f"카테고리 - {sanitize_filename(cat) or '미분류'}.md"
-        links_md = "\n".join(f"- [[{m['filename']}|{m['title']}]]" for m in items)
+        links_md = "\n".join(f"- {wikilink(m)}" for m in items)
         hub_path.write_text(
             "---\n"
             f'title: "카테고리 - {yaml_escape(cat)}"\n'
@@ -540,7 +561,7 @@ def apply_related_links(out_dir: Path, posts_index: dict, log):
 
         content = filepath.read_text(encoding="utf-8")
         content = re.sub(r"\n+## 관련 글\n.*?(?=\n## |\Z)", "\n", content, flags=re.S).rstrip()
-        links_md = "\n".join(f"- [[{o['filename']}|{o['title']}]]"
+        links_md = "\n".join(f"- {wikilink(o)}"
                              for _, o in scored[:RELATED_MAX_LINKS])
         content += f"\n\n## 관련 글\n{links_md}\n"
         filepath.write_text(content, encoding="utf-8")
@@ -630,7 +651,7 @@ def apply_similar_content_links(out_dir: Path, posts_index: dict, log):
         content = filepath.read_text(encoding="utf-8")
         content = re.sub(r"\n+## 비슷한 글\n.*?(?=\n## |\Z)", "\n", content, flags=re.S).rstrip()
         links_md = "\n".join(
-            f"- [[{meta_by_logno[o]['filename']}|{meta_by_logno[o]['title']}]] (유사도 {s:.2f})"
+            f"- {wikilink(meta_by_logno[o])} (유사도 {s:.2f})"
             for s, o in scored[:SIMILAR_MAX_LINKS]
         )
         content += f"\n\n## 비슷한 글\n{links_md}\n"
@@ -640,6 +661,25 @@ def apply_similar_content_links(out_dir: Path, posts_index: dict, log):
     log(f"본문 유사도 링크 {linked}개 글에 추가")
 
 
+SOURCE_LOGNO_RE = re.compile(r"^source:\s*https?://blog\.naver\.com/[^/\s]+/(\d+)", re.MULTILINE)
+
+
+def read_logno(text: str) -> str:
+    """글 번호는 파일 이름이 아니라 본문의 source 주소에서 읽는다.
+
+    파일 이름은 사용자가 바꿀 수 있고 실제로 제목만 쓰기 때문에,
+    이름에 기대면 같은 글을 또 내려받게 된다.
+    """
+    m = SOURCE_LOGNO_RE.search(text)
+    return m.group(1) if m else ""
+
+
+def is_tool_folder(path: Path, out_dir: Path) -> bool:
+    """attachments 나 밑줄로 시작하는 폴더(작업용)는 건드리지 않는다."""
+    rel = path.relative_to(out_dir).parts[:-1]
+    return not any(p == "attachments" or p.startswith("_") for p in rel)
+
+
 def rebuild_index_from_existing_files(out_dir: Path) -> dict:
     """이전 실행으로 이미 저장된 .md 파일도 링크 계산에 포함시킨다."""
     posts_index = {}
@@ -647,13 +687,16 @@ def rebuild_index_from_existing_files(out_dir: Path) -> dict:
         return posts_index
 
     for filepath in out_dir.rglob("*.md"):
-        m = re.match(r"(\d+)_", filepath.name)
-        if not m:
+        if not is_tool_folder(filepath, out_dir):
             continue
         try:
             text = filepath.read_text(encoding="utf-8")
         except OSError:
             continue
+
+        logno = read_logno(text)
+        if not logno:
+            continue        # 카테고리 허브나 사용자가 직접 쓴 노트
 
         title_m = re.search(r'^title:\s*"(.*)"\s*$', text, re.MULTILINE)
         tags_m = re.search(r"^tags:\s*\[(.*)\]\s*$", text, re.MULTILINE)
@@ -662,7 +705,7 @@ def rebuild_index_from_existing_files(out_dir: Path) -> dict:
         parts = text.split("---\n", 2)
         body = parts[2].lstrip("\n") if len(parts) >= 3 else ""
 
-        posts_index[m.group(1)] = {
+        posts_index[logno] = {
             "filename": filepath.stem,
             "path": filepath,
             "title": title_m.group(1).replace('\\"', '"') if title_m else filepath.stem,
@@ -680,12 +723,12 @@ def move_posts_into_category_folders(out_dir: Path, log) -> int:
     """
     moved = 0
     for filepath in sorted(out_dir.glob("*.md")):
-        if not re.match(r"\d+_", filepath.name):
-            continue
         try:
             text = filepath.read_text(encoding="utf-8")
         except OSError:
             continue
+        if not read_logno(text):
+            continue        # 허브나 사용자가 직접 쓴 노트는 그대로 둔다
 
         m = re.search(r'^category:\s*"(.*)"\s*$', text, re.MULTILINE)
         folder = category_dir(out_dir, m.group(1).replace('\\"', '"') if m else "미분류")
@@ -705,6 +748,92 @@ def move_posts_into_category_folders(out_dir: Path, log) -> int:
     return moved
 
 
+# 제목에 대괄호가 들어간 글이 있어([소소연재] ...) 목적지 안의 ] 를 허용해야 한다.
+# 게으른 수량자로 가장 가까운 ]] 까지만 잡는다.
+WIKILINK_RE = re.compile(r"(?<!!)\[\[(.+?)\]\]")
+
+
+def rewrite_wikilinks(text: str, rename: dict) -> str:
+    """[[옛이름]] · [[옛이름|별명]] · [[옛이름#소제목]] 을 새 이름으로 고친다.
+
+    ![[그림.jpg]] 같은 첨부 삽입은 건드리지 않는다 (파일 이름이 그대로이므로).
+    """
+    def replace(m):
+        inner = m.group(1)
+        target = re.split(r"[|#^]", inner, 1)[0]
+        rest = inner[len(target):]
+        new = rename.get(target.strip())
+        if not new:
+            return m.group(0)
+        # 이름과 별명이 같아지면 별명은 군더더기라 뗀다
+        if rest.startswith("|") and rest[1:].strip() == new:
+            rest = ""
+        return f"[[{new}{rest}]]"
+
+    return WIKILINK_RE.sub(replace, text)
+
+
+def rename_notes_to_titles(out_dir: Path, log) -> int:
+    """파일 이름 앞에 붙은 글 번호를 떼고 제목만 남긴다.
+
+    글 번호는 본문의 source 주소에 그대로 있으므로 이름에서는 없어도 된다.
+    이름이 바뀌면 [[링크]]도 따라서 고쳐야 하므로 함께 처리한다.
+    """
+    notes = []
+    for filepath in sorted(out_dir.rglob("*.md")):
+        if not is_tool_folder(filepath, out_dir):
+            continue
+        try:
+            text = filepath.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        logno = read_logno(text)
+        if not logno:
+            continue
+        title_m = re.search(r'^title:\s*"(.*)"\s*$', text, re.MULTILINE)
+        title = title_m.group(1).replace('\\"', '"') if title_m else ""
+        notes.append((filepath, logno, title))
+
+    # 이미 제목만 쓰고 있는 노트의 이름을 먼저 확보한 뒤, 나머지에 이름을 나눠준다
+    used = {f.stem.lower(): logno for f, logno, t in notes
+            if f.stem == (sanitize_filename(t) or logno)}
+    rename, renamed = {}, 0
+
+    for filepath, logno, title in notes:
+        base = sanitize_filename(title) or logno
+        if filepath.stem == base:
+            continue
+        new_name = unique_note_name(base, logno, used)
+        target = filepath.with_name(f"{new_name}.md")
+        if target.exists():
+            continue
+        try:
+            filepath.rename(target)
+        except OSError as e:
+            log(f"  이름을 바꾸지 못함: {filepath.name} -> {e}")
+            continue
+        rename[filepath.stem] = new_name
+        renamed += 1
+
+    if not rename:
+        return 0
+
+    # 이름이 바뀌었으니 볼트 안의 링크를 전부 고친다 (허브 노트 포함)
+    fixed = 0
+    for filepath in out_dir.rglob("*.md"):
+        try:
+            text = filepath.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        new_text = rewrite_wikilinks(text, rename)
+        if new_text != text:
+            filepath.write_text(new_text, encoding="utf-8")
+            fixed += 1
+
+    log(f"글 {renamed}개의 파일 이름에서 글 번호를 뗐습니다. (노트 {fixed}개의 링크도 함께 고침)")
+    return renamed
+
+
 # ============================== 실행 ==============================
 def run_migration(settings: dict, log, progress, should_stop):
     out_dir = Path(settings["out_dir"])
@@ -722,7 +851,9 @@ def run_migration(settings: dict, log, progress, should_stop):
     tag_map = fetch_tags(session, blog_id, [p["logNo"] for p in post_list])
 
     move_posts_into_category_folders(out_dir, log)
+    rename_notes_to_titles(out_dir, log)
     posts_index = rebuild_index_from_existing_files(out_dir)
+    used_names = {m["filename"].lower(): logno for logno, m in posts_index.items()}
     failed = []
     total = len(post_list)
     started = time.time()
@@ -737,7 +868,8 @@ def run_migration(settings: dict, log, progress, should_stop):
 
         logno = entry["logNo"]
 
-        if any(out_dir.rglob(f"{logno}_*.md")):
+        # 파일 이름은 제목만 쓰므로, 이미 받았는지는 색인(글 번호)으로 판단한다
+        if logno in posts_index and post_file(out_dir, posts_index[logno]).exists():
             log(f"[{i}/{total}] 이미 있음 - 건너뜀: {entry['title']}")
             progress(i, total, entry["title"])
             continue
@@ -756,7 +888,7 @@ def run_migration(settings: dict, log, progress, should_stop):
             body = html_to_markdown(parsed["container"])
 
             filepath = save_markdown(out_dir, logno, title, date, category, tags,
-                                     entry["url"], body)
+                                     entry["url"], body, used_names)
 
             posts_index[logno] = {
                 "filename": filepath.stem,
