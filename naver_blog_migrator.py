@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import traceback
+import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -47,6 +48,15 @@ from notion_importer import run_notion_migration
 # ============================== 설정값 ==============================
 DEFAULT_SUBFOLDER = "네이버블로그"
 NOTION_SUBFOLDER = "노션"
+
+NOTION_INTEGRATIONS_URL = "https://www.notion.so/my-integrations"
+# 노션 통합은 명시적으로 연결한 페이지만 볼 수 있다. API 로는 권한을 줄 수 없어
+# 사용자가 노션에서 직접 해줘야 하므로, 순서대로 짚어준다.
+NOTION_SETUP_STEPS = (
+    "[통합 만들기 열기] 를 눌러 통합을 만들고 토큰을 복사합니다",
+    "노션에서 옮기고 싶은 최상위 페이지를 엽니다",
+    "우측 상단 ··· → 연결 → 만든 통합 이름을 추가합니다",
+)
 LOGIN_TIMEOUT = 300          # 로그인 대기 최대 시간(초). 로그인되면 즉시 진행
 COUNT_PER_PAGE = 30
 MAX_LIST_PAGES = 200
@@ -748,7 +758,7 @@ def move_posts_into_category_folders(out_dir: Path, log) -> int:
     return moved
 
 
-# 제목에 대괄호가 들어간 글이 있어([소소연재] ...) 목적지 안의 ] 를 허용해야 한다.
+# 제목에 대괄호를 쓰는 글이 있어([공지] 처럼) 목적지 안의 ] 를 허용해야 한다.
 # 게으른 수량자로 가장 가까운 ]] 까지만 잡는다.
 WIKILINK_RE = re.compile(r"(?<!!)\[\[(.+?)\]\]")
 
@@ -934,6 +944,8 @@ NAVER = "#03c75a"          # 네이버 그린
 NAVER_DARK = "#02a047"
 NOTION = "#37352f"         # 노션 잉크
 NOTION_DARK = "#25231e"
+GUIDE_BG = "#efeee9"       # 안내 상자
+GUIDE_FG = "#5b574d"
 TEXT = "#1a1a1a"
 MUTED = "#6b7280"
 OK_GREEN = "#059669"
@@ -1125,20 +1137,38 @@ class NotionTab(BaseTab):
                                    bg=BG, fg=MUTED, font=(FONT, 8), anchor="w", justify="left")
         self.token_hint.pack(anchor="w", fill="x")
 
-        guide = tk.Frame(self, bg="#efeee9", padx=12, pady=10)
+        guide = tk.Frame(self, bg=GUIDE_BG, padx=12, pady=10)
         guide.pack(fill="x", pady=(12, 0))
-        tk.Label(guide, text="처음이라면 노션에서 한 번만 해주세요", bg="#efeee9", fg=NOTION,
-                 font=(FONT, 9, "bold")).pack(anchor="w")
-        tk.Label(guide,
-                 text="옮기고 싶은 최상위 페이지 열기 → 우측 상단 ··· → 연결 → 통합 이름 추가\n"
-                      "하위 페이지와 데이터베이스는 자동으로 따라옵니다.",
-                 bg="#efeee9", fg="#5b574d", font=(FONT, 8), justify="left").pack(anchor="w")
+
+        head = tk.Frame(guide, bg=GUIDE_BG)
+        head.pack(fill="x")
+        tk.Label(head, text="처음이라면 노션에서 한 번만 해주세요", bg=GUIDE_BG, fg=NOTION,
+                 font=(FONT, 9, "bold")).pack(side="left")
+        tk.Button(head, text="통합 만들기 열기", command=self._open_integrations,
+                  bg="white", fg=TEXT, relief="solid", bd=1, cursor="hand2",
+                  font=(FONT, 8), padx=8).pack(side="right")
+
+        for step, text in enumerate(NOTION_SETUP_STEPS, start=1):
+            row = tk.Frame(guide, bg=GUIDE_BG)
+            row.pack(fill="x", pady=(5 if step == 1 else 2, 0))
+            tk.Label(row, text=str(step), bg=NOTION, fg="white",
+                     font=(FONT, 8, "bold"), width=2).pack(side="left")
+            tk.Label(row, text=text, bg=GUIDE_BG, fg=GUIDE_FG, font=(FONT, 8),
+                     justify="left", anchor="w").pack(side="left", padx=(6, 0))
+
+        tk.Label(guide, text="하위 페이지와 데이터베이스는 자동으로 따라옵니다."
+                             " 다 하셨으면 [연결 확인]을 눌러 보세요.",
+                 bg=GUIDE_BG, fg=GUIDE_FG, font=(FONT, 8),
+                 justify="left").pack(anchor="w", pady=(7, 0))
 
         self.section("옵션")
         self.files_var = tk.BooleanVar(value=True)
         self.skip_var = tk.BooleanVar(value=True)
         self.check("이미지 · 파일 · PDF 첨부 모두 내려받기", self.files_var)
         self.check("이미 있는 노트는 건너뛰기", self.skip_var)
+
+    def _open_integrations(self):
+        webbrowser.open(NOTION_INTEGRATIONS_URL)
 
     def _toggle_show(self):
         self.token_entry.config(show="" if self.show_var.get() else "●")
