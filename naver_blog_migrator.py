@@ -2,7 +2,7 @@
 옵시디언(Obsidian) 마이그레이션 도구 (GUI)
 ==========================================
 
-두 곳에서 글을 가져올 수 있습니다.
+세 곳에서 내용을 가져올 수 있습니다.
 
 [네이버 블로그]
 - 블로그 아이디는 로그인한 계정에서 자동으로 알아냅니다.
@@ -16,6 +16,10 @@
 [노션]
 - 통합(Integration) 토큰으로 페이지·데이터베이스·첨부를 전부 가져옵니다.
 - 읽기만 합니다. 노션 데이터는 수정하거나 지우지 않습니다.
+
+[엑셀]
+- 시트 하나가 노트 하나가 됩니다. 이름이 비슷한 시트끼리 폴더로 묶습니다.
+- 읽기만 합니다. 원본 파일은 수정하거나 지우지 않습니다.
 """
 
 import json
@@ -44,10 +48,12 @@ from selenium.common.exceptions import WebDriverException
 from migrator_common import Stopped
 from notion_importer import check_token as notion_check_token
 from notion_importer import run_notion_migration
+from excel_importer import inspect_workbook, run_excel_migration
 
 # ============================== 설정값 ==============================
 DEFAULT_SUBFOLDER = "네이버블로그"
 NOTION_SUBFOLDER = "노션"
+EXCEL_SUBFOLDER = "엑셀"
 
 NOTION_INTEGRATIONS_URL = "https://www.notion.so/my-integrations"
 # 노션 통합은 명시적으로 연결한 페이지만 볼 수 있다. API 로는 권한을 줄 수 없어
@@ -944,6 +950,8 @@ NAVER = "#03c75a"          # 네이버 그린
 NAVER_DARK = "#02a047"
 NOTION = "#37352f"         # 노션 잉크
 NOTION_DARK = "#25231e"
+EXCEL = "#217346"          # 엑셀 초록
+EXCEL_DARK = "#17532f"
 GUIDE_BG = "#efeee9"       # 안내 상자
 GUIDE_FG = "#5b574d"
 TEXT = "#1a1a1a"
@@ -1226,6 +1234,147 @@ class NotionTab(BaseTab):
         self.skip_var.set(saved.get("skip_existing", True))
 
 
+class ExcelTab(BaseTab):
+    accent, accent_dark = EXCEL, EXCEL_DARK
+    tab_label = "  엑셀  "
+    caption = "시트 하나가 노트 하나가 됩니다 (읽기 전용)"
+    default_subfolder = EXCEL_SUBFOLDER
+    settings_key = "excel"
+
+    def build(self):
+        self.section("엑셀 파일")
+
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", pady=(6, 2))
+        self.files_list = tk.Listbox(row, height=4, font=(FONT, 9), relief="solid", bd=1,
+                                     bg="white", selectmode="extended",
+                                     activestyle="none")
+        self.files_list.pack(side="left", fill="x", expand=True)
+
+        side = tk.Frame(row, bg=BG)
+        side.pack(side="left", fill="y", padx=(8, 0))
+        for text, cmd in (("파일 추가", self._add_files),
+                          ("선택 삭제", self._remove_selected),
+                          ("파일 확인", self._inspect)):
+            tk.Button(side, text=text, command=cmd, bg="white", fg=TEXT,
+                      relief="solid", bd=1, cursor="hand2",
+                      font=(FONT, 9), width=9).pack(pady=(0, 4))
+
+        self.files_hint = tk.Label(self, text="옮길 .xlsx 파일을 추가해 주세요. 여러 개를 한 번에 골라도 됩니다.",
+                                   bg=BG, fg=MUTED, font=(FONT, 8), anchor="w", justify="left")
+        self.files_hint.pack(anchor="w", fill="x")
+
+        guide = tk.Frame(self, bg=GUIDE_BG, padx=12, pady=10)
+        guide.pack(fill="x", pady=(12, 0))
+        tk.Label(guide, text="이렇게 옮깁니다", bg=GUIDE_BG, fg=EXCEL,
+                 font=(FONT, 9, "bold")).pack(anchor="w")
+        tk.Label(guide,
+                 text="시트 하나 = 노트 하나. 이름이 비슷한 시트끼리 폴더로 묶습니다.\n"
+                      "표는 마크다운 표로, 글이 긴 시트는 읽기 좋게 문단으로 폅니다.\n"
+                      "시트에 박힌 그림은 attachments 폴더로 꺼냅니다.",
+                 bg=GUIDE_BG, fg=GUIDE_FG, font=(FONT, 8), justify="left").pack(anchor="w",
+                                                                                pady=(4, 0))
+
+        self.section("옵션")
+        self.img_var = tk.BooleanVar(value=True)
+        self.skip_var = tk.BooleanVar(value=True)
+        self.check("시트에 박힌 그림도 꺼내기", self.img_var)
+        self.check("이미 있는 노트는 건너뛰기", self.skip_var)
+
+    # ---------- 파일 목록 ----------
+    def _add_files(self):
+        chosen = filedialog.askopenfilenames(
+            title="옮길 엑셀 파일을 고르세요",
+            filetypes=[("엑셀 통합문서", "*.xlsx *.xlsm"), ("모든 파일", "*.*")])
+        current = set(self.files_list.get(0, "end"))
+        added = 0
+        for path in chosen:
+            if path not in current:
+                self.files_list.insert("end", path)
+                added += 1
+        if added:
+            self.files_hint.config(text=f"{added}개 추가 · 모두 {self.files_list.size()}개",
+                                   fg=MUTED)
+
+    def _remove_selected(self):
+        for i in reversed(self.files_list.curselection()):
+            self.files_list.delete(i)
+        self.files_hint.config(text=f"모두 {self.files_list.size()}개", fg=MUTED)
+
+    def _inspect(self):
+        paths = list(self.files_list.get(0, "end"))
+        if not paths:
+            self.files_hint.config(text="먼저 파일을 추가해 주세요.", fg=WARN)
+            return
+        self.files_hint.config(text="살펴보는 중...", fg=MUTED)
+
+        def work():
+            sheets = images = 0
+            folders, bad = set(), []
+            for path in paths:
+                try:
+                    info = inspect_workbook(path)
+                except Exception as e:
+                    bad.append(f"{Path(path).name}: {e}")
+                    continue
+                sheets += info["sheets"]
+                images += info["images"]
+                folders.update(info["folders"])
+
+            if bad:
+                msg, color = " · ".join(bad[:2]), DANGER
+            else:
+                msg = f"파일 {len(paths)}개 · 시트 {sheets}개 → 노트 {sheets}개"
+                if folders:
+                    shown = ", ".join(sorted(folders)[:3])
+                    more = f" 외 {len(folders) - 3}개" if len(folders) > 3 else ""
+                    msg += f" · 폴더 {len(folders)}개 ({shown}{more})"
+                if images:
+                    msg += f" · 그림 {images}개"
+                color = OK_GREEN
+            self.after(0, lambda: self.files_hint.config(text=msg, fg=color))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- 실행 ----------
+    def collect(self):
+        paths = list(self.files_list.get(0, "end"))
+        if not paths:
+            messagebox.showwarning("확인", "옮길 엑셀 파일을 추가해 주세요.")
+            return None
+
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            messagebox.showwarning("확인", "찾을 수 없는 파일이 있습니다:\n"
+                                   + "\n".join(Path(p).name for p in missing[:5]))
+            return None
+
+        out_dir = self.path_var.get().strip()
+        if not out_dir:
+            messagebox.showwarning("확인", "저장 위치를 선택해 주세요.")
+            return None
+
+        return {
+            "out_dir": out_dir,
+            "files": paths,
+            "extract_images": self.img_var.get(),
+            "skip_existing": self.skip_var.get(),
+        }
+
+    def run(self, settings, log, progress, should_stop):
+        return run_excel_migration(settings, log, progress, should_stop)
+
+    def restore(self, saved):
+        super().restore(saved)
+        self.img_var.set(saved.get("extract_images", True))
+        self.skip_var.set(saved.get("skip_existing", True))
+        for path in saved.get("files", []):
+            if Path(path).exists():
+                self.files_list.insert("end", path)
+        if self.files_list.size():
+            self.files_hint.config(text=f"모두 {self.files_list.size()}개", fg=MUTED)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1271,7 +1420,8 @@ class App(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=18, pady=(12, 0))
 
-        self.tabs = [NaverTab(self.notebook), NotionTab(self.notebook)]
+        self.tabs = [NaverTab(self.notebook), NotionTab(self.notebook),
+                     ExcelTab(self.notebook)]
         for tab in self.tabs:
             self.notebook.add(tab, text=tab.tab_label)
         self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._on_tab_change())
