@@ -1,6 +1,6 @@
 """
-옵시디언(Obsidian) 마이그레이션 도구 (GUI)
-==========================================
+Obsidian Migrator (GUI)
+=======================
 
 세 곳에서 내용을 가져올 수 있습니다.
 
@@ -1378,7 +1378,7 @@ class ExcelTab(BaseTab):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("옵시디언 마이그레이션")
+        self.title("Obsidian Migrator")
         self.geometry("760x820")
         self.minsize(680, 720)
         self.configure(bg=BG)
@@ -1410,7 +1410,7 @@ class App(tk.Tk):
         self.header = tk.Frame(self, bg=NAVER, height=76)
         self.header.pack(fill="x")
         self.header.pack_propagate(False)
-        self.header_title = tk.Label(self.header, text="옵시디언 마이그레이션", bg=NAVER,
+        self.header_title = tk.Label(self.header, text="Obsidian Migrator", bg=NAVER,
                                      fg="white", font=(FONT, 16, "bold"))
         self.header_title.pack(anchor="w", padx=24, pady=(16, 0))
         self.header_sub = tk.Label(self.header, text="", bg=NAVER, fg="#eef7f1", font=(FONT, 9))

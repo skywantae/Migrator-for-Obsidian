@@ -1,4 +1,4 @@
-# 옵시디언 마이그레이션 도구
+# Obsidian Migrator
 
 네이버 블로그 · 노션(Notion) · 엑셀(.xlsx)의 내용을 **옵시디언 노트로 옮기는** GUI 도구입니다.
 
@@ -13,7 +13,7 @@
 
 ```bash
 pip install -r requirements.txt
-python naver_blog_migrator.py
+python obsidian_migrator.py
 ```
 
 1. 탭을 고릅니다 — **네이버 블로그** / **노션** / **엑셀**
@@ -264,24 +264,24 @@ notion_id: 1ceed4c2-66d2-488d-b106-a3432664e5ac
 ### 네이버 스킨별 HTML 차이
 - 신버전(SmartEditor ONE)과 구버전(SmartEditor 2)은 구조가 다를 수 있습니다
 - 본문·제목·날짜가 비어 나오면 크롬 F12로 실제 셀렉터를 확인하고
-  `naver_blog_migrator.py` 의 `SELECTORS` 를 수정하세요
+  `obsidian_migrator.py` 의 `SELECTORS` 를 수정하세요
 
 ---
 
 ## exe 로 만들어 쓰기 (파이썬 없는 PC 에서)
 
 ```bash
-pyinstaller --windowed --onefile --name naver_blog_migrator --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options naver_blog_migrator.py
+pyinstaller --windowed --onefile --name obsidian_migrator --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options obsidian_migrator.py
 ```
 
-`dist/naver_blog_migrator.exe` 가 만들어집니다. 더블클릭하면 창이 뜹니다.
+`dist/obsidian_migrator.exe` 가 만들어집니다. 더블클릭하면 창이 뜹니다.
 (exe 는 용량이 커서 저장소에 넣지 않았습니다)
 
 ## 구성
 
 | 파일 | 역할 |
 | --- | --- |
-| `naver_blog_migrator.py` | GUI + 네이버 블로그 수집 |
+| `obsidian_migrator.py` | GUI + 네이버 블로그 수집 |
 | `notion_importer.py` | 노션 수집 · 블록→마크다운 변환 |
 | `excel_importer.py` | 엑셀 시트→노트 변환 |
 | `migrator_common.py` | 공통 (중단 신호) |
