@@ -22,6 +22,7 @@ Obsidian Migrator (GUI)
 - 읽기만 합니다. 원본 파일은 수정하거나 지우지 않습니다.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -488,14 +489,23 @@ def unique_note_name(base: str, logno: str, used: dict) -> str:
     return name
 
 
+def compute_content_hash(text: str) -> str:
+    """본문의 텍스트 내용을 기반으로 변경 감지용 해시를 계산한다."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
 def save_markdown(out_dir: Path, logno: str, title: str, date: str, category: str,
-                  tags: list, url: str, body: str, used_names: dict = None) -> Path:
+                  tags: list, url: str, body: str, used_names: dict = None,
+                  content_hash: str = "") -> Path:
     folder = category_dir(out_dir, category)
     folder.mkdir(parents=True, exist_ok=True)
     base = sanitize_filename(title) or logno
     name = unique_note_name(base, logno, used_names) if used_names is not None else base
     filepath = folder / f"{name}.md"
     tags_yaml = ", ".join(f'"{yaml_escape(t)}"' for t in tags)
+    if not content_hash:
+        content_hash = compute_content_hash(body)
     frontmatter = (
         "---\n"
         f'title: "{yaml_escape(title)}"\n'
@@ -503,6 +513,7 @@ def save_markdown(out_dir: Path, logno: str, title: str, date: str, category: st
         f'category: "{yaml_escape(category)}"\n'
         f"tags: [{tags_yaml}]\n"
         f"source: {url}\n"
+        f"content_hash: {content_hash}\n"
         "---\n\n"
     )
     filepath.write_text(frontmatter + body + "\n", encoding="utf-8")
@@ -697,7 +708,7 @@ def is_tool_folder(path: Path, out_dir: Path) -> bool:
 
 
 def rebuild_index_from_existing_files(out_dir: Path) -> dict:
-    """이전 실행으로 이미 저장된 .md 파일도 링크 계산에 포함시킨다."""
+    """이전 실행으로 이미 저장된 .md 파일도 링크 계산 및 증분 동기화에 포함시킨다."""
     posts_index = {}
     if not out_dir.exists():
         return posts_index
@@ -717,9 +728,12 @@ def rebuild_index_from_existing_files(out_dir: Path) -> dict:
         title_m = re.search(r'^title:\s*"(.*)"\s*$', text, re.MULTILINE)
         tags_m = re.search(r"^tags:\s*\[(.*)\]\s*$", text, re.MULTILINE)
         category_m = re.search(r'^category:\s*"(.*)"\s*$', text, re.MULTILINE)
+        hash_m = re.search(r"^content_hash:\s*([0-9a-fA-F]+)", text, re.MULTILINE)
 
         parts = text.split("---\n", 2)
         body = parts[2].lstrip("\n") if len(parts) >= 3 else ""
+        clean_body = strip_linked_sections(body).strip()
+        chash = hash_m.group(1).strip() if hash_m else compute_content_hash(clean_body)
 
         posts_index[logno] = {
             "filename": filepath.stem,
@@ -727,7 +741,8 @@ def rebuild_index_from_existing_files(out_dir: Path) -> dict:
             "title": title_m.group(1).replace('\\"', '"') if title_m else filepath.stem,
             "tags": re.findall(r'"([^"]*)"', tags_m.group(1)) if tags_m else [],
             "category": category_m.group(1).replace('\\"', '"') if category_m else "미분류",
-            "text_sample": strip_markdown_for_similarity(strip_linked_sections(body)),
+            "content_hash": chash,
+            "text_sample": strip_markdown_for_similarity(clean_body),
         }
     return posts_index
 
@@ -869,13 +884,22 @@ def run_migration(settings: dict, log, progress, should_stop):
     move_posts_into_category_folders(out_dir, log)
     rename_notes_to_titles(out_dir, log)
     posts_index = rebuild_index_from_existing_files(out_dir)
+    if posts_index:
+        log(f"기존 블로그 글 {len(posts_index)}개 확인 (동기화 기준)")
+
     used_names = {m["filename"].lower(): logno for logno, m in posts_index.items()}
     failed = []
+    rename_map = {}
+    stats = {"created": 0, "updated": 0, "skipped": 0}
     total = len(post_list)
     started = time.time()
     image_count = 0
 
-    log(f"총 {total}개의 글을 저장합니다 -> {out_dir}")
+    skip_existing = settings.get("skip_existing", True)
+    check_content = settings.get("check_content_updates", True)
+    check_recent_limit = settings.get("check_recent_count", 30)
+
+    log(f"총 {total}개의 글을 확인합니다 -> {out_dir}")
     progress(0, total, "")
 
     for i, entry in enumerate(post_list, start=1):
@@ -883,12 +907,42 @@ def run_migration(settings: dict, log, progress, should_stop):
             raise Stopped()
 
         logno = entry["logNo"]
+        new_title = entry["title"]
+        new_category = category_names.get(entry["category_no"], "미분류")
+        old_meta = posts_index.get(logno)
+        old_exists = bool(old_meta and post_file(out_dir, old_meta).exists())
 
-        # 파일 이름은 제목만 쓰므로, 이미 받았는지는 색인(글 번호)으로 판단한다
-        if logno in posts_index and post_file(out_dir, posts_index[logno]).exists():
-            log(f"[{i}/{total}] 이미 있음 - 건너뜀: {entry['title']}")
-            progress(i, total, entry["title"])
-            continue
+        # 변경 없는 기존 글 건너뛰기 판단
+        if skip_existing and old_exists:
+            old_title = old_meta.get("title", "")
+            old_category = old_meta.get("category", "")
+            title_changed = bool(old_title and new_title and old_title != new_title and new_title != "제목없음")
+            category_changed = bool(old_category and new_category and old_category != new_category)
+
+            # 제목이나 카테고리가 안 바뀌었으면 본문 수정 검사 여부 확인
+            if not title_changed and not category_changed:
+                if check_content and i <= check_recent_limit:
+                    try:
+                        html = fetch_post_html(session, blog_id, logno)
+                        parsed = parse_post(html)
+                        temp_body = html_to_markdown(parsed["container"])
+                        cur_hash = compute_content_hash(temp_body)
+                        if cur_hash == old_meta.get("content_hash"):
+                            # 본문 내용 동일 -> 스킵!
+                            stats["skipped"] += 1
+                            progress(i, total, entry["title"])
+                            continue
+                        # 본문 내용 다름 -> 업데이트 진행
+                    except Exception:
+                        pass
+                else:
+                    # 변경 없음 건너뜀
+                    stats["skipped"] += 1
+                    progress(i, total, entry["title"])
+                    continue
+
+        is_update = old_exists
+        status_label = "업데이트" if is_update else "신규"
 
         try:
             html = fetch_post_html(session, blog_id, logno)
@@ -896,15 +950,27 @@ def run_migration(settings: dict, log, progress, should_stop):
 
             title = parsed["title"] or entry["title"]
             date = parsed["date"] or entry["date"]
-            category = category_names.get(entry["category_no"], "미분류")
+            category = new_category
             tags = tag_map.get(logno) or parsed["tags"]
 
             image_count += download_images_and_rewrite(
                 session, parsed["container"], logno, attachments_dir, settings["download_images"])
             body = html_to_markdown(parsed["container"])
+            content_hash = compute_content_hash(body)
+
+            # 기존 파일 위치와 다른 새 파일로 저장되는 경우 기존 파일 정리
+            old_filepath = post_file(out_dir, old_meta) if old_meta else None
 
             filepath = save_markdown(out_dir, logno, title, date, category, tags,
-                                     entry["url"], body, used_names)
+                                     entry["url"], body, used_names, content_hash)
+
+            if is_update and old_filepath and old_filepath.exists() and old_filepath.resolve() != filepath.resolve():
+                try:
+                    if old_meta.get("filename") and old_meta["filename"] != filepath.stem:
+                        rename_map[old_meta["filename"]] = filepath.stem
+                    old_filepath.unlink()
+                except OSError:
+                    pass
 
             posts_index[logno] = {
                 "filename": filepath.stem,
@@ -912,12 +978,18 @@ def run_migration(settings: dict, log, progress, should_stop):
                 "title": title,
                 "tags": tags,
                 "category": category,
+                "content_hash": content_hash,
                 "text_sample": strip_markdown_for_similarity(body),
             }
 
+            if is_update:
+                stats["updated"] += 1
+            else:
+                stats["created"] += 1
+
             elapsed = time.time() - started
             eta = elapsed / i * (total - i)
-            log(f"[{i}/{total}] {title}  ({category})  · 남은 시간 약 {eta/60:.1f}분")
+            log(f"[{i}/{total}] [{status_label}] {title} ({category}) · 남은 시간 약 {eta/60:.1f}분")
         except Stopped:
             raise
         except Exception as e:
@@ -925,6 +997,21 @@ def run_migration(settings: dict, log, progress, should_stop):
             failed.append(entry["url"])
 
         progress(i, total, entry["title"])
+
+    # 만약 제목 변경으로 파일명이 바뀐 글이 있다면 위키링크 갱신
+    if rename_map:
+        fixed = 0
+        for filepath in out_dir.rglob("*.md"):
+            try:
+                text = filepath.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            new_text = rewrite_wikilinks(text, rename_map)
+            if new_text != text:
+                filepath.write_text(new_text, encoding="utf-8")
+                fixed += 1
+        if fixed:
+            log(f"노트 {fixed}개의 내부 링크를 새 제목으로 갱신했습니다.")
 
     if settings["make_links"] and posts_index:
         log("")
@@ -936,9 +1023,13 @@ def run_migration(settings: dict, log, progress, should_stop):
         (out_dir / "_failed_urls.txt").write_text("\n".join(failed), encoding="utf-8")
         log(f"\n실패한 글 {len(failed)}개 (_failed_urls.txt 에 저장). 다시 실행하면 재시도합니다.")
 
+    log(f"\n완료: 신규 {stats['created']}개, 업데이트 {stats['updated']}개, 변경 없음 {stats['skipped']}개 (실패 {len(failed)}개)")
     return {
         "elapsed": time.time() - started,
-        "saved": total - len(failed),
+        "saved": stats["created"] + stats["updated"],
+        "created": stats["created"],
+        "updated": stats["updated"],
+        "skipped": stats["skipped"],
         "failed": len(failed),
         "images": image_count,
         "out_dir": out_dir,
@@ -1073,8 +1164,12 @@ class NaverTab(BaseTab):
         self.section("옵션")
         self.img_var = tk.BooleanVar(value=True)
         self.link_var = tk.BooleanVar(value=True)
+        self.skip_var = tk.BooleanVar(value=True)
+        self.check_content_var = tk.BooleanVar(value=True)
         self.check("이미지를 원본 화질로 저장", self.img_var)
         self.check("카테고리 · 관련 글 자동 링크 만들기", self.link_var)
+        self.check("변경 없는 글은 건너뛰기 (수정·신규 포스팅만 업데이트)", self.skip_var)
+        self.check("최근 글 본문 내용 수정도 확인 (최근 30개 정밀 검사)", self.check_content_var)
 
         tk.Label(self, text="시작하면 크롬 창이 열립니다. 로그인하면 알아서 다음으로 넘어갑니다.",
                  bg=BG, fg=MUTED, font=(FONT, 8)).pack(anchor="w", pady=(12, 0))
@@ -1101,6 +1196,9 @@ class NaverTab(BaseTab):
             "max_posts": max_posts,
             "download_images": self.img_var.get(),
             "make_links": self.link_var.get(),
+            "skip_existing": self.skip_var.get(),
+            "check_content_updates": self.check_content_var.get(),
+            "check_recent_count": 30,
         }
 
     def run(self, settings, log, progress, should_stop):
@@ -1110,6 +1208,8 @@ class NaverTab(BaseTab):
         super().restore(saved)
         self.img_var.set(saved.get("download_images", True))
         self.link_var.set(saved.get("make_links", True))
+        self.skip_var.set(saved.get("skip_existing", True))
+        self.check_content_var.set(saved.get("check_content_updates", True))
         if saved.get("max_posts"):
             self.scope_var.set("some")
             self.count_spin.delete(0, "end")
@@ -1173,7 +1273,7 @@ class NotionTab(BaseTab):
         self.files_var = tk.BooleanVar(value=True)
         self.skip_var = tk.BooleanVar(value=True)
         self.check("이미지 · 파일 · PDF 첨부 모두 내려받기", self.files_var)
-        self.check("이미 있는 노트는 건너뛰기", self.skip_var)
+        self.check("변경 없는 노트는 건너뛰기 (수정·신규 페이지만 업데이트)", self.skip_var)
 
     def _open_integrations(self):
         webbrowser.open(NOTION_INTEGRATIONS_URL)

@@ -672,12 +672,16 @@ def _render_table(client, block, data, ctx, should_stop):
 def build_frontmatter(page: dict, title: str, extra: dict = None) -> str:
     lines = ["---", f'title: "{yaml_escape(title)}"']
 
-    created = (page.get("created_time") or "")[:10]
-    edited = (page.get("last_edited_time") or "")[:10]
+    created_raw = page.get("created_time") or ""
+    edited_raw = page.get("last_edited_time") or ""
+    created = created_raw[:10]
+    edited = edited_raw[:10]
     if created:
         lines.append(f"created: {created}")
     if edited:
         lines.append(f"updated: {edited}")
+    if edited_raw:
+        lines.append(f"last_edited_time: {edited_raw}")
 
     props = page.get("properties") or {}
     for name, prop in props.items():
@@ -708,7 +712,7 @@ def build_frontmatter(page: dict, title: str, extra: dict = None) -> str:
     return "\n".join(lines)
 
 
-RESERVED_KEYS = {"title", "created", "updated", "source", "notion_id", "tags", "aliases", "cssclasses"}
+RESERVED_KEYS = {"title", "created", "updated", "last_edited_time", "source", "notion_id", "tags", "aliases", "cssclasses"}
 
 
 def _yaml_key(name: str) -> str:
@@ -728,6 +732,42 @@ def unique_note_name(name: str, used: set) -> str:
         n += 1
     used.add(candidate.lower())
     return candidate
+
+
+def rebuild_notion_index(out_dir: Path) -> dict:
+    """기존 마이그레이션된 노션 노트들을 스캔하여 색인을 구성한다.
+    반환값: {notion_id(정규화): {"path": Path, "last_edited_time": str, "updated": str, "title": str}}
+    """
+    index = {}
+    if not out_dir.exists():
+        return index
+
+    for filepath in out_dir.rglob("*.md"):
+        rel_parts = filepath.relative_to(out_dir).parts
+        if "attachments" in rel_parts:
+            continue
+
+        try:
+            text = filepath.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        id_m = re.search(r"^notion_id:\s*([0-9a-fA-F-]+)", text, re.MULTILINE)
+        if not id_m:
+            continue
+
+        clean_id = id_m.group(1).replace("-", "").lower()
+        title_m = re.search(r'^title:\s*"(.*)"\s*$', text, re.MULTILINE)
+        let_m = re.search(r"^last_edited_time:\s*([^\r\n]+)", text, re.MULTILINE)
+        upd_m = re.search(r"^updated:\s*([^\r\n]+)", text, re.MULTILINE)
+
+        index[clean_id] = {
+            "path": filepath,
+            "title": title_m.group(1).replace('\\"', '"') if title_m else filepath.stem,
+            "last_edited_time": let_m.group(1).strip() if let_m else "",
+            "updated": upd_m.group(1).strip() if upd_m else "",
+        }
+    return index
 
 
 # ============================== 전체 실행 ==============================
@@ -776,8 +816,13 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
         link_map[oid] = info["note_name"]
         link_map[oid.replace("-", "")] = info["note_name"]
 
+    skip_existing = settings.get("skip_existing", True)
+    existing_index = rebuild_notion_index(out_dir)
+    if existing_index:
+        log(f"기존 노션 노트 {len(existing_index)}개 확인 (동기화 기준)")
+
     file_session = requests.Session()
-    stats = {"pages": 0, "files": 0, "failed": 0, "skipped": 0}
+    stats = {"created": 0, "updated": 0, "skipped": 0, "failed": 0, "files": 0}
     unresolved = set()          # 가져오지 못한 페이지로 향하던 링크
     lost_files = []             # 끝내 받지 못한 첨부 (노트, 파일명, 주소)
     started = time.time()
@@ -785,7 +830,7 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
     queue = deque(paths.keys())
     total = len(queue)
     done = 0
-    log(f"\n노트 {total}개를 저장합니다 -> {out_dir}")
+    log(f"\n노트 {total}개를 확인합니다 -> {out_dir}")
     progress(0, total, "")
 
     while queue:
@@ -793,15 +838,40 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
             raise Stopped()
 
         oid = queue.popleft()
+        clean_oid = oid.replace("-", "").lower()
         info = paths[oid]
         obj = objects[oid]
         done += 1
 
         target = info["path"]
-        if target.exists() and settings.get("skip_existing", True):
-            stats["skipped"] += 1
-            progress(done, total, info["note_name"])
-            continue
+        obj_edited = obj.get("last_edited_time") or ""
+        existing = existing_index.get(clean_oid)
+
+        # 변경 없는 기존 노트 건너뛰기 판단
+        if skip_existing and existing and existing["path"].exists():
+            is_same = False
+            if existing["last_edited_time"] and obj_edited:
+                is_same = (existing["last_edited_time"] == obj_edited)
+            elif existing["updated"] and obj_edited:
+                is_same = obj_edited.startswith(existing["updated"])
+
+            if is_same:
+                if existing["path"] != target:
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        existing["path"].rename(target)
+                        existing["path"] = target
+                        stats["updated"] += 1
+                        log(f"[{done}/{total}] [위치 이동] {info['note_name']}")
+                    except OSError:
+                        stats["skipped"] += 1
+                else:
+                    stats["skipped"] += 1
+                progress(done, total, info["note_name"])
+                continue
+
+        is_update = bool(existing and existing["path"].exists())
+        status_label = "업데이트" if is_update else "신규"
 
         try:
             ctx = {
@@ -834,13 +904,30 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
             body = _resolve_page_refs(body, link_map, unresolved)
             front = _resolve_page_refs(front, link_map, unresolved)
 
+            if is_update and existing["path"] != target and existing["path"].exists():
+                try:
+                    existing["path"].unlink()
+                except OSError:
+                    pass
+
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(f"{front}\n\n{body}\n", encoding="utf-8")
-            stats["pages"] += 1
+
+            if is_update:
+                stats["updated"] += 1
+            else:
+                stats["created"] += 1
+
+            existing_index[clean_oid] = {
+                "path": target,
+                "title": info["title"],
+                "last_edited_time": obj_edited,
+                "updated": obj_edited[:10],
+            }
 
             elapsed = time.time() - started
             eta = elapsed / done * (total - done)
-            log(f"[{done}/{total}] {info['note_name']}  · 남은 시간 약 {eta / 60:.1f}분")
+            log(f"[{done}/{total}] [{status_label}] {info['note_name']}  · 남은 시간 약 {eta / 60:.1f}분")
 
         except Stopped:
             raise
@@ -863,12 +950,16 @@ def run_notion_migration(settings: dict, log, progress, should_stop):
             + "\n".join(f"[{note}] {fname}\n  {furl}" for note, fname, furl in lost_files),
             encoding="utf-8")
         log(f"\n첨부 {len(lost_files)}개를 받지 못했습니다. 목록: {report.name}")
-    log(f"\nAPI 호출 {client.calls}회")
+
+    log(f"\n완료: 신규 {stats['created']}개, 업데이트 {stats['updated']}개, 변경 없음 {stats['skipped']}개 (실패 {stats['failed']}개)")
+    log(f"API 호출 {client.calls}회")
     return {
         "elapsed": time.time() - started,
-        "saved": stats["pages"],
-        "failed": stats["failed"],
+        "saved": stats["created"] + stats["updated"],
+        "created": stats["created"],
+        "updated": stats["updated"],
         "skipped": stats["skipped"],
+        "failed": stats["failed"],
         "images": stats["files"],
         "out_dir": out_dir,
     }
