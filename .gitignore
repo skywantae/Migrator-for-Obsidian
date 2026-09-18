@@ -8,5 +8,8 @@ build/
 settings.json
 obsidian_export/
 _*.py
+!src/__init__.py
+!__init__.py
 *.exe
+!obsidian_migrator.exe
 *.spec

@@ -35,7 +35,7 @@ jobs:
             --hidden-import selenium.webdriver.chrome.webdriver `
             --hidden-import selenium.webdriver.chrome.service `
             --hidden-import selenium.webdriver.chrome.options `
-            obsidian_migrator.py
+            src/obsidian_migrator.py
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

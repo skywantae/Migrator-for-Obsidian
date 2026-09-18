@@ -8,8 +8,8 @@
 > ### 🚀 Windows 무설치 단일 실행 파일 다운로드
 > 파이썬이나 복잡한 환경 설정 없이 더블클릭만으로 즉시 사용할 수 있습니다.
 > 
-> 👉 **[⬇️ obsidian_migrator.exe 최신 버전 다운로드 (Releases)](https://github.com/skywantae/Migrator-for-Obsidian/releases/latest/download/obsidian_migrator.exe)**
-> *(브라우저에서 다운로드 후 바로 실행하시면 됩니다)*
+> 👉 **[⬇️ obsidian_migrator.exe 즉시 다운로드](https://github.com/skywantae/Migrator-for-Obsidian/raw/main/obsidian_migrator.exe)**
+> *(브라우저에서 클릭 시 404 에러 없이 바로 다운로드됩니다)*
 
 네이버 블로그 · 노션(Notion) · 엑셀(.xlsx)의 내용을 **옵시디언 노트로 옮기는** GUI 도구입니다.
 
@@ -23,13 +23,13 @@
 ## 빠르게 시작하기
 
 ### 1. 무설치 실행 파일로 시작하기 (권장)
-- [Releases 페이지](https://github.com/skywantae/Migrator-for-Obsidian/releases/latest)에서 **`obsidian_migrator.exe`** 를 다운로드하여 실행합니다.
+- 저장소에 포함된 **`obsidian_migrator.exe`** 를 다운로드하여 더블클릭하면 바로 실행됩니다.
 - 파이썬이나 별도 라이브러리 설치가 전혀 필요하지 않습니다.
 
 ### 2. 소스 코드로 직접 실행 (개발자용)
 ```bash
 pip install -r requirements.txt
-python obsidian_migrator.py
+python src/obsidian_migrator.py
 ```
 
 ### 사용 순서
@@ -292,7 +292,7 @@ notion_id: 1ceed4c2-66d2-488d-b106-a3432664e5ac
 ## exe 로 만들어 쓰기 (파이썬 없는 PC 에서)
 
 ```bash
-pyinstaller --windowed --onefile --name obsidian_migrator --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options obsidian_migrator.py
+pyinstaller --windowed --onefile --name obsidian_migrator --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options src/obsidian_migrator.py
 ```
 
 저장소 루트에 최신 `obsidian_migrator.exe`가 포함되어 있습니다. 직접 다시 빌드하려면 위 명령어를 실행하세요.
@@ -301,10 +301,11 @@ pyinstaller --windowed --onefile --name obsidian_migrator --hidden-import seleni
 
 | 파일 | 역할 |
 | --- | --- |
-| `obsidian_migrator.py` | GUI + 네이버 블로그 수집 |
-| `notion_importer.py` | 노션 수집 · 블록→마크다운 변환 |
-| `excel_importer.py` | 엑셀 시트→노트 변환 |
-| `migrator_common.py` | 공통 (중단 신호) |
+| `obsidian_migrator.exe` | 무설치 단일 실행 파일 (Windows용) |
+| `src/obsidian_migrator.py` | GUI + 네이버 블로그 수집 |
+| `src/notion_importer.py` | 노션 수집 · 블록→마크다운 변환 |
+| `src/excel_importer.py` | 엑셀 시트→노트 변환 |
+| `src/migrator_common.py` | 공통 모듈 (중단 신호 처리) |
 
 ## 라이센스
 

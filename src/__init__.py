@@ -1,0 +1,1 @@
+"""Obsidian Migrator Source Package."""
