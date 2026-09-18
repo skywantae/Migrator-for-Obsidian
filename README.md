@@ -11,11 +11,16 @@
 
 ## 빠르게 시작하기
 
+### 1. 간편 실행 (파이썬 미설치 PC)
+저장소에 포함된 **`obsidian_migrator.exe`** 를 다운로드하여 더블클릭하면 바로 실행됩니다.
+
+### 2. 소스 코드로 직접 실행
 ```bash
 pip install -r requirements.txt
 python obsidian_migrator.py
 ```
 
+### 사용 순서
 1. 탭을 고릅니다 — **네이버 블로그** / **노션** / **엑셀**
 2. **[폴더 선택]** 으로 옵시디언 볼트 안에 저장할 폴더를 지정합니다
    - 마지막에 열었던 볼트를 자동으로 찾아 기본값으로 넣어 줍니다
@@ -278,8 +283,7 @@ notion_id: 1ceed4c2-66d2-488d-b106-a3432664e5ac
 pyinstaller --windowed --onefile --name obsidian_migrator --hidden-import selenium.webdriver.chrome.webdriver --hidden-import selenium.webdriver.chrome.service --hidden-import selenium.webdriver.chrome.options obsidian_migrator.py
 ```
 
-`dist/obsidian_migrator.exe` 가 만들어집니다. 더블클릭하면 창이 뜹니다.
-(exe 는 용량이 커서 저장소에 넣지 않았습니다)
+저장소 루트에 최신 `obsidian_migrator.exe`가 포함되어 있습니다. 직접 다시 빌드하려면 위 명령어를 실행하세요.
 
 ## 구성
 
