@@ -1,5 +1,16 @@
 # Obsidian Migrator
 
+[![GitHub Release](https://img.shields.io/github/v/release/skywantae/Migrator-for-Obsidian?style=flat-square&color=111111&label=Release)](https://github.com/skywantae/Migrator-for-Obsidian/releases/latest)
+[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows)](https://github.com/skywantae/Migrator-for-Obsidian/releases/latest)
+[![License](https://img.shields.io/badge/License-MIT-gray?style=flat-square)](LICENSE)
+
+> [!TIP]
+> ### 🚀 Windows 무설치 단일 실행 파일 다운로드
+> 파이썬이나 복잡한 환경 설정 없이 더블클릭만으로 즉시 사용할 수 있습니다.
+> 
+> 👉 **[⬇️ obsidian_migrator.exe 최신 버전 다운로드 (Releases)](https://github.com/skywantae/Migrator-for-Obsidian/releases/latest/download/obsidian_migrator.exe)**
+> *(브라우저에서 다운로드 후 바로 실행하시면 됩니다)*
+
 네이버 블로그 · 노션(Notion) · 엑셀(.xlsx)의 내용을 **옵시디언 노트로 옮기는** GUI 도구입니다.
 
 창을 열면 탭이 세 개 있습니다. 필요한 쪽을 골라 쓰세요.
@@ -11,10 +22,11 @@
 
 ## 빠르게 시작하기
 
-### 1. 간편 실행 (파이썬 미설치 PC)
-저장소에 포함된 **`obsidian_migrator.exe`** 를 다운로드하여 더블클릭하면 바로 실행됩니다.
+### 1. 무설치 실행 파일로 시작하기 (권장)
+- [Releases 페이지](https://github.com/skywantae/Migrator-for-Obsidian/releases/latest)에서 **`obsidian_migrator.exe`** 를 다운로드하여 실행합니다.
+- 파이썬이나 별도 라이브러리 설치가 전혀 필요하지 않습니다.
 
-### 2. 소스 코드로 직접 실행
+### 2. 소스 코드로 직접 실행 (개발자용)
 ```bash
 pip install -r requirements.txt
 python obsidian_migrator.py
