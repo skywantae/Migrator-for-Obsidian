@@ -8,8 +8,7 @@
 > ### 🚀 Windows 무설치 단일 실행 파일 다운로드
 > 파이썬이나 복잡한 환경 설정 없이 더블클릭만으로 즉시 사용할 수 있습니다.
 > 
-> 👉 **[⬇️ obsidian_migrator.exe 즉시 다운로드](https://github.com/skywantae/Migrator-for-Obsidian/raw/main/obsidian_migrator.exe)**
-> *(브라우저에서 클릭 시 404 에러 없이 바로 다운로드됩니다)*
+> [obsidian_migrator.exe 다운로드](https://github.com/skywantae/Migrator-for-Obsidian/raw/main/obsidian_migrator.exe)**
 
 네이버 블로그 · 노션(Notion) · 엑셀(.xlsx)의 내용을 **옵시디언 노트로 옮기는** GUI 도구입니다.
 
